@@ -68,7 +68,9 @@ def run(command: list, prompt: str, cwd, timeout: int, queue=None) -> dict:
     reset = queue.limit_until()
     if reset:
         raise LimitReached(reset, f"Claude's usage limit is in force until {reset:%H:%M}")
-    env = {**os.environ, "DISABLE_AUTOUPDATER": "1"}
+    # CLAUDE_HEADLESS (0.1.1, 18 Nov 2026): lets a Claude Code hook tell a tool's run from a person's session and
+    # stay out of it, as the .NET ClaudeHeadless does.
+    env = {**os.environ, "DISABLE_AUTOUPDATER": "1", "CLAUDE_HEADLESS": "1"}
     done = subprocess.run([exe(), *command], input=prompt, cwd=cwd, capture_output=True, text=True, env=env,
                           encoding="utf-8", timeout=timeout, creationflags=NO_WINDOW)
     try:
