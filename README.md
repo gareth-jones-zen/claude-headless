@@ -67,6 +67,57 @@ review = { source = "team-chat", type = "draft", title = "Marketing chat: post f
 failed = { source = "team-chat", type = "failed", title = "Marketing chat: couldn't draft {date:dd/MM}", reason = "{error}" }
 ```
 
+### Conversations: several turns, files to read, a table to keep (0.3.0)
+
+A job can also be a conversation with files, such as a monthly report reviewed in two messages:
+
+- **`[[job.turn]]`s** in place of `prompt`: each turn's `prompt` (a file) or `text`, with `replace`ments filled in
+  after the template (`{ "<paste here>" = "{extract.headlines}" }`). Turn 2 on resumes turn 1's conversation, and
+  each turn's reply is `{turn.N}` (its session `{turn.N.session}`). **At a usage limit, the rerun carries on from
+  the turn that was cut off**, from a progress file kept beside the work folder (not in it, where Claude reads).
+- **`[[job.extract]]`s** take text out of the input's `field` or a `file`: cut at `upto`, `tidy` the spacing, keep
+  what's `after` and `before` two patterns, or a `pattern`'s first group (no match is a failure). `{extract.NAME}`.
+- **`[[job.prepare]]`s** run before turn 1, in the settings' folder: `run` a command (a non-zero exit fails the
+  job, with what it said) or `copy` a file `to` somewhere, usually into `{work}`. **`fresh_work = true`** empties
+  the work folder first, so Claude finds only what the steps put there.
+- **`body_template`** is a file the output's body is filled from (`{turn.1}`, `{extract.*}`), instead of a section.
+- **`table`** keeps a CSV from a reply's fenced block (`file`, `turn`, `block`): **rows it doesn't have are added;
+  rows it has are never changed.** Where the reply's copy differs, `{table.changes}` says how, column by column
+  (`2026-08: churn 1.2 -> 1.3`), for a person to decide; `{table.added}` is the new rows.
+- **`commit_also`** commits other files the job made (those that exist), **`notify`** shows a Windows notification
+  (`title`, `text`), and **`--force`** runs a job whose output is already there. `{today}`, `{work}` and
+  `{input.path}` are there for any template.
+- **Put a job's own keys before its `[[job.…]]` tables**: in TOML, keys after a table header belong to that table.
+
+```toml
+[[job]]
+name = "report"
+output = "../reports/{date:yyyy-MM}.md"
+work = "%LOCALAPPDATA%/my-tools/report/{date:yyyy-MM}"
+fresh_work = true
+claude = ["-p", "--output-format", "json", "--model", "claude-opus-5-5", "--tools", "Read", "--restricted", "--strict-mcp-config"]
+timeout_minutes = 60
+body_template = "report/review.md"
+table = { file = "../reports/series.csv", turn = 1, block = '(?s)```(?:csv)?\n(month,.*?)```' }
+frontmatter = ["report: {date:yyyy-MM}", "session: {turn.1.session}"]
+commit = "Review the {date:yyyy-MM} report"
+review = { source = "report", type = "review", title = "Review {date:yyyy-MM}", new_rows = "{table.added}?", changes = "{table.changes}?" }
+
+[[job.extract]]
+name = "headlines"
+field = "body"
+tidy = true
+after = '(?i)main points[^\n:]*:'
+
+[[job.prepare]]
+run = ["powershell", "-NoProfile", "-File", "report/deck-to-pdf.ps1", "-InputJson", "{input.path}", "-Pdf", "{work}/deck.pdf"]
+
+[[job.turn]]
+prompt = "report/first.md"
+[[job.turn]]
+text = "Now compare with the headlines:\n\n{extract.headlines}"
+```
+
 ## The Python package
 
 On a subscription seat, everything you run shares one usage limit. A batch of background jobs
