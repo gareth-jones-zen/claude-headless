@@ -14,19 +14,44 @@ namespace ClaudeHeadlessTool;
 public class UsageException(string message) : Exception(message);
 
 /// <summary>Where a job's date comes from: a pattern on an input field ("13/11" in a subject: day, then month; the
-/// year that puts it nearest before the input's received date), otherwise the received date.</summary>
-public sealed record DateRule(string Field, Regex Pattern, string Otherwise);
+/// year that puts it nearest before the input's received date), otherwise the received date (with no pattern, always).</summary>
+public sealed record DateRule(string? Field, Regex? Pattern, string Otherwise);
+
+/// <summary>One turn of a conversation (0.3.0): a prompt (a template file, or text), with replacements made after
+/// it's filled. Turn 2 on resumes turn 1's conversation, in the same folder.</summary>
+public sealed record TurnSpec(string? PromptFile, string? Text, IReadOnlyList<(string From, string To)> Replace);
+
+/// <summary>A value cut from the input or a file (0.3.0), as {extract.NAME}: the text up to `upto`, spaces tidied if
+/// asked, then what's after `after` and before `before` (each if it matches), then `pattern`'s first group (which must
+/// match), trimmed.</summary>
+public sealed record ExtractSpec(string Name, string? Field, string? File, Regex? Upto, bool Tidy, Regex? After, Regex? Before, Regex? Pattern);
+
+/// <summary>A step before Claude (0.3.0): copy a file, or run a command, each a template.</summary>
+public sealed record PrepareStep(IReadOnlyList<string>? Run, string? Copy, string? To);
+
+/// <summary>A table (CSV) a reply adds rows to (0.3.0): the last fenced block in a turn's reply that matches block
+/// (its first group, from the header line on). Rows whose key (the first column) is new are added; existing rows are
+/// never changed: where the reply's copy differs, the difference is reported ({table.changes}) for a person to decide.</summary>
+public sealed record TableSpec(string File, int Turn, Regex Block);
 
 /// <summary>One [[job]] kind: take an input, give it to Claude with a prompt, check the reply, put the output here.</summary>
 public sealed class JobKind
 {
     public required string Name { get; init; }
-    public required string Prompt { get; init; }                                  // a template file
+    public string? Prompt { get; init; }                                          // a template file (one turn)
+    public IReadOnlyList<TurnSpec> Turns { get; init; } = [];                       // or a conversation (0.3.0)
+    public IReadOnlyList<ExtractSpec> Extracts { get; init; } = [];
+    public IReadOnlyList<PrepareStep> Prepare { get; init; } = [];
+    public bool FreshWork { get; init; }                                            // empty the work folder first
+    public string? BodyTemplate { get; init; }                                      // the output's body, from a template file
+    public TableSpec? Table { get; init; }
+    public IReadOnlyList<string> CommitAlso { get; init; } = [];
+    public (string Title, string Text)? Notify { get; init; }
     public IReadOnlyDictionary<string, string> Context { get; init; } = new Dictionary<string, string>();   // name: file
     public IReadOnlyDictionary<string, string> Values { get; init; } = new Dictionary<string, string>();    // name: text
     public DateRule? Date { get; init; }
     public required string Output { get; init; }                                  // a path template
-    public required string Work { get; init; }                                    // Claude's folder: empty
+    public required string Work { get; init; }                                    // Claude's folder: a path template
     public IReadOnlyList<string> Claude { get; init; } = [];
     public int TimeoutMinutes { get; init; } = 15;
     public IReadOnlyList<(string Name, bool Required)> Sections { get; init; } = [];
@@ -58,6 +83,9 @@ public sealed class JobsConfig
     public string? ReviewFile { get; init; }
     public string? ReviewLock { get; init; }
     public string? LogFile { get; init; }
+
+    /// <summary>A path setting as a full path, relative to the settings file, with ~ and %VARIABLES%.</summary>
+    public required Func<string, string> Resolve { get; init; }
 
     public static JobsConfig Load(string path, Func<string, string?> env)
     {
@@ -127,7 +155,8 @@ public sealed class JobsConfig
             {
                 var where = $"[[job]] {(t.TryGetValue("name", out var n) ? n : "(no name)")}";
                 string[] keys = ["name", "prompt", "context", "values", "date", "output", "work", "claude", "timeout_minutes", "sections",
-                    "body", "must_match", "empty_items", "replace", "frontmatter", "marker", "commit", "commit_body", "review", "failed", "delete_input"];
+                    "body", "must_match", "empty_items", "replace", "frontmatter", "marker", "commit", "commit_body", "review", "failed", "delete_input",
+                    "turn", "extract", "prepare", "fresh_work", "body_template", "table", "commit_also", "notify"];
                 foreach (var key in t.Keys)
                     if (!keys.Contains(key))
                         throw Bad(where, $"has an unknown setting '{key}'");
@@ -136,23 +165,69 @@ public sealed class JobsConfig
                 {
                     if (d is not TomlTable dt)
                         throw Bad(where, "date should be a table: field, pattern, otherwise");
-                    date = new DateRule(Text(dt, "field", where), new Regex(Text(dt, "pattern", where), RegexOptions.CultureInvariant),
-                        Text(dt, "otherwise", where, "received"));
+                    var field = dt.TryGetValue("field", out _) ? Text(dt, "field", where) : null;
+                    var pattern = dt.TryGetValue("pattern", out _) ? new Regex(Text(dt, "pattern", where), RegexOptions.CultureInvariant) : null;
+                    if ((field is null) != (pattern is null))
+                        throw Bad(where, "date needs field and pattern together, or neither (the received date)");
+                    date = new DateRule(field, pattern, Text(dt, "otherwise", where, "received"));
                 }
                 var sections = Texts(t, "sections", where).Select(s => s.EndsWith('?') ? (s[..^1], false) : (s, true)).ToList();
                 var body = t.TryGetValue("body", out _) ? Text(t, "body", where) : null;
                 if (body is not null && !sections.Any(s => s.Item1 == body))
                     throw Bad(where, $"body '{body}' isn't one of its sections");
                 var name = Text(t, "name", where);
+                IEnumerable<TomlTable> Tables(string key) => !t.TryGetValue(key, out var v) ? []
+                    : v as TomlTableArray ?? throw Bad(where, $"{key} should be [[job.{key}]] tables");
+                Regex? Rx(TomlTable table, string key) =>
+                    table.TryGetValue(key, out _) ? new Regex(Text(table, key, where), RegexOptions.CultureInvariant) : null;
+                var turns = Tables("turn").Select(tt => new TurnSpec(
+                    tt.TryGetValue("prompt", out _) ? Resolve(Text(tt, "prompt", where)) : null,
+                    tt.TryGetValue("text", out _) ? Text(tt, "text", where) : null,
+                    Table(tt, "replace", where).Select(kv => (kv.Key, kv.Value)).ToList())).ToList();
+                if (turns.Any(tu => (tu.PromptFile is null) == (tu.Text is null)))
+                    throw Bad(where, "each [[job.turn]] needs prompt (a file) or text, not both");
+                if (turns.Count == 0 && !t.TryGetValue("prompt", out _))
+                    throw Bad(where, "needs prompt, or [[job.turn]]s");
+                var extracts = Tables("extract").Select(e => new ExtractSpec(Text(e, "name", where),
+                    e.TryGetValue("field", out _) ? Text(e, "field", where) : null, e.TryGetValue("file", out _) ? Resolve(Text(e, "file", where)) : null,
+                    Rx(e, "upto"), e.TryGetValue("tidy", out var ti) && ti is true, Rx(e, "after"), Rx(e, "before"), Rx(e, "pattern"))).ToList();
+                if (extracts.Any(e => (e.Field is null) == (e.File is null)))
+                    throw Bad(where, "each [[job.extract]] needs field (from the input) or file, not both");
+                var prepare = Tables("prepare").Select(p => new PrepareStep(
+                    p.TryGetValue("run", out _) ? Texts(p, "run", where) : null,
+                    p.TryGetValue("copy", out _) ? Text(p, "copy", where) : null,
+                    p.TryGetValue("to", out _) ? Text(p, "to", where) : null)).ToList();
+                if (prepare.Any(p => (p.Run is null) == (p.Copy is null) || (p.Copy is not null && p.To is null)))
+                    throw Bad(where, "each [[job.prepare]] needs run, or copy with to");
+                TableSpec? tableSpec = null;
+                if (t.TryGetValue("table", out var tb))
+                {
+                    if (tb is not TomlTable tt)
+                        throw Bad(where, "table should be a table: file, turn, block");
+                    tableSpec = new TableSpec(Text(tt, "file", where),
+                        tt.TryGetValue("turn", out var tn) ? tn is long ln && ln >= 1 ? (int)ln : throw Bad(where, "table.turn should be 1 or more") : 1,
+                        Rx(tt, "block") ?? throw Bad(where, "table needs block, a pattern for the fenced block"));
+                }
+                (string, string)? notify = null;
+                if (t.TryGetValue("notify", out var no))
+                    notify = no is TomlTable nt ? (Text(nt, "title", where), Text(nt, "text", where)) : throw Bad(where, "notify should be a table: title, text");
                 kinds[name] = new JobKind
                 {
                     Name = name,
-                    Prompt = Resolve(Text(t, "prompt", where)),
+                    Prompt = t.TryGetValue("prompt", out _) ? Resolve(Text(t, "prompt", where)) : null,
+                    Turns = turns,
+                    Extracts = extracts,
+                    Prepare = prepare,
+                    FreshWork = t.TryGetValue("fresh_work", out var fw) && (fw is bool fb ? fb : throw Bad(where, "fresh_work should be true or false")),
+                    BodyTemplate = t.TryGetValue("body_template", out _) ? Resolve(Text(t, "body_template", where)) : null,
+                    Table = tableSpec,
+                    CommitAlso = Texts(t, "commit_also", where),
+                    Notify = notify,
                     Context = Table(t, "context", where).ToDictionary(kv => kv.Key, kv => Resolve(kv.Value)),
                     Values = Table(t, "values", where),
                     Date = date,
                     Output = Text(t, "output", where),
-                    Work = Resolve(Text(t, "work", where)),
+                    Work = Text(t, "work", where),
                     Claude = Texts(t, "claude", where) is { Count: > 0 } c ? c : ["-p", "--output-format", "json"],
                     TimeoutMinutes = t.TryGetValue("timeout_minutes", out var tm) ? tm is long m && m is >= 1 and <= 240 ? (int)m : throw Bad(where, "timeout_minutes should be 1 to 240") : 15,
                     Sections = sections,
@@ -192,7 +267,7 @@ public sealed class JobsConfig
         }
         return new JobsConfig
         {
-            Path = full, Dir = dir, Kinds = kinds, Git = git, ReviewFile = reviewFile, ReviewLock = reviewLock,
+            Path = full, Dir = dir, Kinds = kinds, Git = git, ReviewFile = reviewFile, ReviewLock = reviewLock, Resolve = Resolve,
             LogFile = raw.TryGetValue("log_file", out var lf) && lf is string { Length: > 0 } lfs ? Resolve(lfs) : null,
         };
     }
@@ -248,7 +323,7 @@ public static partial class Jobs
     public static DateOnly DateOf(DateRule? rule, JsonObject input)
     {
         var received = Iso(Field(input, rule?.Otherwise ?? "received")) is { } r ? DateOnly.FromDateTime(r.DateTime) : DateOnly.FromDateTime(DateTime.Today);
-        if (rule is null || rule.Pattern.Match(Field(input, rule.Field)) is not { Success: true } m || m.Groups.Count < 3)
+        if (rule?.Pattern is null || rule.Pattern.Match(Field(input, rule.Field!)) is not { Success: true } m || m.Groups.Count < 3)
             return received;
         if (!int.TryParse(m.Groups[1].Value, CultureInfo.InvariantCulture, out var day) || !int.TryParse(m.Groups[2].Value, CultureInfo.InvariantCulture, out var month))
             return received;
@@ -289,6 +364,78 @@ public static partial class Jobs
         if (missing.Count > 0)
             throw new InvalidDataException($"the reply has no {string.Join(" / ", missing)} section{(missing.Count > 1 ? "s" : "")}");
         return found;
+    }
+
+    /// <summary>An extract's value (see ExtractSpec): from the input's field or the file.</summary>
+    public static string Extract(ExtractSpec spec, JsonObject input)
+    {
+        var text = spec.Field is not null ? Field(input, spec.Field) : File.ReadAllText(spec.File!, Encoding.UTF8);
+        text = text.Replace("\r\n", "\n", StringComparison.Ordinal);
+        if (spec.Upto?.Match(text) is { Success: true } upto)
+            text = text[..upto.Index];
+        if (spec.Tidy)
+        {
+            text = Regex.Replace(text, "[ \t\u00a0]+", " ");
+            text = Regex.Replace(text, @"\n\s*\n+", "\n\n").Trim();
+        }
+        if (spec.After?.Match(text) is { Success: true } after)
+            text = text[(after.Index + after.Length)..];
+        if (spec.Before?.Match(text) is { Success: true } before)
+            text = text[..before.Index];
+        if (spec.Pattern is not null)
+            text = spec.Pattern.Match(text) is { Success: true } m && m.Groups.Count > 1 ? m.Groups[1].Value
+                : throw new InvalidDataException($"extract {spec.Name}: {spec.Pattern} doesn't match");
+        return text.Trim();
+    }
+
+    /// <summary>A table merge (see TableSpec): the file's text with the reply's new rows added, the rows added, and how
+    /// the reply's copy differs from the file's existing rows (a line each; never applied). No block: null.</summary>
+    public static (string Text, List<string> Added, List<string> Changes)? Merge(string existing, string reply, Regex block)
+    {
+        var matches = block.Matches(reply);
+        if (matches.Count == 0)
+            return null;
+        var proposed = matches[^1].Groups[1].Value.Replace("\r\n", "\n", StringComparison.Ordinal).Trim().Split('\n')
+            .Select(l => l.TrimEnd()).Where(l => l.Length > 0).ToList();
+        var newline = existing.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
+        if (existing.Trim().Length == 0)   // no table yet: the reply's is the start of it
+            return (string.Join(newline, proposed) + newline, proposed.Skip(1).ToList(), []);
+        var lines = existing.Replace("\r\n", "\n", StringComparison.Ordinal).TrimEnd('\n').Split('\n').ToList();
+        static string Key(string row) => row.Split(',')[0].Trim();
+        var changes = new List<string>();
+        if (proposed.Count > 0 && proposed[0] != lines[0])
+            changes.Add($"header: {lines[0]} -> {proposed[0]}");
+        var rows = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var row in lines.Skip(1))
+            rows.TryAdd(Key(row), row);
+        var added = new List<string>();
+        foreach (var row in proposed.Skip(1))
+        {
+            if (!rows.TryGetValue(Key(row), out var mine))
+            {
+                added.Add(row);
+                rows[Key(row)] = row;
+            }
+            else if (mine != row)
+                changes.Add($"{Key(row)}: {Differences(lines[0], mine, row)}");
+        }
+        var text = string.Join(newline, lines.Concat(added)) + newline;
+        return (text, added, changes);
+    }
+
+    /// <summary>How two rows differ, column by column, named from the header: "base 104 -> 105, churn (empty) -> 1.2".</summary>
+    private static string Differences(string header, string mine, string theirs)
+    {
+        var names = header.Split(',');
+        var (a, b) = (mine.Split(','), theirs.Split(','));
+        var parts = new List<string>();
+        for (var i = 0; i < Math.Max(a.Length, b.Length); i++)
+        {
+            var (x, y) = (i < a.Length ? a[i] : "", i < b.Length ? b[i] : "");
+            if (x != y)
+                parts.Add($"{(i < names.Length ? names[i] : $"column {i + 1}")} {(x.Length > 0 ? x : "(empty)")} -> {(y.Length > 0 ? y : "(empty)")}");
+        }
+        return string.Join(", ", parts);
     }
 
     /// <summary>A section as items: its lines without a leading "- " or "* ", blank ones and "none"-like ones left out.</summary>
