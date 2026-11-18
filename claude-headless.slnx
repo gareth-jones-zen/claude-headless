@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="src/ClaudeHeadlessTool/ClaudeHeadlessTool.csproj" />
+  <Project Path="src/ClaudeHeadlessTool.Console/ClaudeHeadlessTool.Console.csproj" />
+  <Project Path="src/ClaudeHeadlessTool.Background/ClaudeHeadlessTool.Background.csproj" />
+
+  <Project Path="tests/ClaudeHeadlessTool.Tests/ClaudeHeadlessTool.Tests.csproj" />
+</Solution>

@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>claude-headless</AssemblyName>
+    <RootNamespace>ClaudeHeadlessTool</RootNamespace>
+    <PublishAot>true</PublishAot>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\ClaudeHeadlessTool\ClaudeHeadlessTool.csproj" />
+  </ItemGroup>
+</Project>

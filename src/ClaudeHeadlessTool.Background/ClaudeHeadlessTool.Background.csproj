@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <AssemblyName>claude-headless-background</AssemblyName>
+    <RootNamespace>ClaudeHeadlessTool</RootNamespace>
+    <PublishAot>true</PublishAot>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\ClaudeHeadlessTool\ClaudeHeadlessTool.csproj" />
+  </ItemGroup>
+</Project>

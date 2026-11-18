@@ -2,6 +2,73 @@
 
 Run Claude Code headless (`claude -p`) from background tools, and survive the usage limit.
 
+**Two forms, one queue.** The **.NET exe** (`claude-headless.exe`, since 0.2.0: Windows x64, Native AOT, no runtime)
+has the queue commands and **jobs defined in settings**. The **Python package** below (`src/claude_headless`) is the
+original, for Python scripts that run Claude themselves; both use the same queue, so either runner runs either's jobs.
+
+## The exe
+
+```
+claude-headless status            the usage limit, if one is in force, and what's queued
+claude-headless run-queue         run queued jobs one at a time, until done or the limit is back
+claude-headless autostart on      run the queue every 15 minutes and at logon (off, status)
+claude-headless --config FILE job KIND --input FILE [--out FILE]
+```
+
+Install: unzip `claude-headless-<version>-win-x64.zip` from
+[Releases](https://github.com/gareth-jones-zen/claude-headless/releases) to a folder that will stay put, such as
+`%LOCALAPPDATA%\Programs\claude-headless`. The queue commands are background-tools-lib's ClaudeHeadless.
+
+### Jobs: input, prompt, output
+
+A `[[job]]` is "take this input, give it to Claude with this prompt, check the reply, put the output here", all in
+settings, so a new kind of job is a new table, not new code. Something (a mail-triage queue handler, say) puts
+`claude-headless --config FILE job KIND --input saved.json` on the queue; the runner runs it.
+
+- **The input** is a JSON object (an email, as mail-triage saves one): its fields are `{input.FIELD}` in templates.
+- **The prompt** is a template file, with `{input.*}`, `{value.NAME}` (text from the settings), `{context.NAME}` (a
+  file's text, such as your rules) and `{date}`. Values are put in as they are, braces and all; `{{` and `}}` are
+  literal braces in the template.
+- **Claude** runs with the settings' arguments (`claude`) in an empty folder (`work`), so it reads nothing it
+  isn't given. Every run sets `CLAUDE_HEADLESS=1`, so your Claude Code hooks can tell it from your own sessions.
+- **The reply is checked**: the `sections` it must have ("NAME:" lines; "NAME?" for optional), which one is the
+  output's `body`, patterns the body must match (`must_match`), and `replace`ments applied to it. Other sections
+  become lists of items (`{LEFT OUT}`, joined with "; "), "none" and the like left out.
+- **The output** goes to `output` (a path template), with `frontmatter` lines (a line ending `?` is left out when
+  anything in it is empty) and a `marker` line before the body. It's committed with `[git]` (`commit`,
+  `commit_body`), a `review` item is added to the `[review]` queue, and the input is deleted.
+- **If the output is already there**, it does nothing. **At the usage limit** the job puts itself back on the queue
+  for after the reset. **A reply of the wrong shape**, or Claude failing, adds the `failed` item and exits 1, keeping
+  the input for a rerun. **`--out FILE`** writes there instead: no commit, no item, the input kept.
+
+```toml
+base = "base-config.toml"       # optional: shared settings; [git] and [review] can come from it
+
+[git]                           # repo, push, trailers
+[review]                        # file, lock: background-tools-lib's ReviewQueue
+
+[[job]]
+name = "marketing"
+prompt = "team-chat/post-prompt.md"
+context = { rules = "team-chat/marketing-picks.md" }
+values = { what = "the ExCo Marketing update", title = "Marketing updates chat" }
+date = { field = "subject", pattern = '\b(\d{1,2})/(\d{1,2})\b', otherwise = "received" }   # day/month in the subject
+output = "../comms/team-chat/marketing/{date:yyyy-MM-dd}.md"
+work = "%LOCALAPPDATA%/my-tools/marketing-work"
+claude = ["-p", "--output-format", "json", "--model", "opus", "--tools", "Read", "--restricted", "--strict-mcp-config"]
+sections = ["POST", "LEFT OUT", "CHECK?"]
+body = "POST"
+must_match = ['\AFrom ', '(?m)^- ']
+replace = { "—" = "-" }
+frontmatter = ['source: {input.from} "{input.subject}"', "status: draft", "left-out: {LEFT OUT|nothing}", "check: {CHECK}?"]
+marker = "[DRAFT]"
+commit = "Draft post for the marketing chat from {date:dd/MM} [DRAFT]"
+review = { source = "team-chat", type = "draft", title = "Marketing chat: post from {date:dd/MM}", file = "{output}" }
+failed = { source = "team-chat", type = "failed", title = "Marketing chat: couldn't draft {date:dd/MM}", reason = "{error}" }
+```
+
+## The Python package
+
 On a subscription seat, everything you run shares one usage limit. A batch of background jobs
 can hit it in minutes; the first time it happened here, 25 of 32 jobs failed one after another,
 each with its own failure notification. This library turns the limit into a queue instead:
