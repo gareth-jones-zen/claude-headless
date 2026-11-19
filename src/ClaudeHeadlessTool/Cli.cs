@@ -24,6 +24,12 @@ public sealed class CliHost
     public Action<string, IEnumerable<string>> Notify { get; init; } = Toast.Notify;
     public Func<DateOnly> Today { get; init; } = () => DateOnly.FromDateTime(DateTime.Now);
 
+    /// <summary>The wall clock, for schedules (0.4.0).</summary>
+    public Func<DateTime> Now { get; init; } = () => DateTime.Now;
+
+    /// <summary>The program a scheduled job is queued to run with: the windowless exe beside this one.</summary>
+    public Func<string> ScheduledExe { get; init; } = () => Path.Combine(AppContext.BaseDirectory, "claude-headless-background.exe");
+
     /// <summary>Runs a prepare step's command in a folder: (exit code, what it said). Tests give a fake.</summary>
     public Func<IReadOnlyList<string>, string, (int Exit, string Output)> RunStep { get; init; } = (argv, cwd) =>
     {
@@ -40,11 +46,14 @@ public sealed class CliHost
 public static class Cli
 {
     public const string Usage =
-        "usage: claude-headless [-h] [--version] [--config CONFIG] {status,run-queue,autostart,job} ...\n\n" +
+        "usage: claude-headless [-h] [--version] [--config CONFIG] {status,run-queue,autostart,schedule,job} ...\n\n" +
         "claude-headless: the seat's queue of Claude Code jobs waiting out a usage limit, and jobs defined in settings.\n\n" +
         "    claude-headless status          the limit, if one is in force, and what's queued\n" +
-        "    claude-headless run-queue       run queued jobs one at a time, until done or the limit is back\n" +
+        "    claude-headless run-queue       queue any scheduled jobs that are due, then run queued jobs one at a time,\n" +
+        "                                    until done or the limit is back\n" +
         "    claude-headless autostart on    run the queue every 15 minutes (Task Scheduler); off, status\n" +
+        "    claude-headless --config FILE schedule on|off|status\n" +
+        "                                    whether run-queue starts this settings file's scheduled jobs\n" +
         "    claude-headless --config FILE job KIND --input FILE\n" +
         "                                    a job from the settings: the input and the prompt to Claude, the reply\n" +
         "                                    checked and written where the settings say, committed, and a review item\n" +
@@ -77,6 +86,22 @@ public static class Cli
         {
             host.Out.WriteLine(Version);
             return 0;
+        }
+        if (args.Count > 0 && args[0] == "schedule")
+            return Schedule(args.Skip(1).ToList(), config, host);
+        if (args.Count == 1 && args[0] == "run-queue")
+        {
+            // The scheduled jobs that are due go on the queue first, so this run starts them.
+            var log = Logger.Create(host.Queue.LogFile, host.LogEcho);
+            try
+            {
+                Schedules.Check(host.Queue.Home, config is null ? null : Path.GetFullPath(config), host.Now(), host.Env, host.ScheduledExe,
+                    (argv, cwd) => host.Queue.Add(argv, cwd), log);
+            }
+            catch (Exception error)
+            {
+                log($"schedule: check failed: {error.GetType().Name}: {error.Message}");
+            }
         }
         if (args.Count == 0 || args[0] != "job")
             return HeadlessCli.Run(args, new HeadlessHost
@@ -123,9 +148,78 @@ public static class Cli
 
     private static int Bad(CliHost host, string message)
     {
-        host.Err.WriteLine("usage: claude-headless [-h] [--version] [--config CONFIG] {status,run-queue,autostart,job} ...");
+        host.Err.WriteLine("usage: claude-headless [-h] [--version] [--config CONFIG] {status,run-queue,autostart,schedule,job} ...");
         host.Err.WriteLine($"claude-headless: error: {message}");
         return 2;
+    }
+
+    /// <summary>schedule on|off|status (0.4.0): whether run-queue starts a settings file's [[job.schedule]]s. The queue
+    /// task is registered without settings, so the settings file is recorded beside the queue instead.</summary>
+    private static int Schedule(List<string> args, string? config, CliHost host)
+    {
+        if (args.Count != 1 || args[0] is not ("on" or "off" or "status"))
+            return Bad(host, "schedule needs one of on, off, status");
+        var home = host.Queue.Home;
+        var now = host.Now();
+        try
+        {
+            if (args[0] == "off")
+            {
+                if (config is null)
+                    return Bad(host, "schedule off needs --config FILE");
+                var path = JobsConfig.Load(config, host.Env).Path;
+                host.Out.WriteLine(Schedules.Off(home, path) ? $"Schedules are off for {path}." : $"Schedules were already off for {path}.");
+                return 0;
+            }
+            if (args[0] == "on")
+            {
+                if (config is null)
+                    return Bad(host, "schedule on needs --config FILE");
+                var settings = JobsConfig.Load(config, host.Env);
+                Schedules.On(home, settings, now);
+                host.Out.WriteLine($"Schedules are on for {settings.Path}: run-queue (the queue task) starts each job when it's due.");
+                ShowSchedules(settings, home, now, host);
+                return 0;
+            }
+            var files = config is null ? Schedules.Recorded(home).ToList() : [JobsConfig.Load(config, host.Env).Path];
+            if (files.Count == 0)
+                host.Out.WriteLine("No settings file's schedules are on (claude-headless --config FILE schedule on).");
+            foreach (var file in files)
+            {
+                var on = Schedules.Recorded(home).Contains(file, StringComparer.OrdinalIgnoreCase);
+                host.Out.WriteLine(on ? $"Schedules are on for {file}." : $"Schedules are off for {file} (schedule on to start them).");
+                try
+                {
+                    ShowSchedules(JobsConfig.Load(file, host.Env), home, now, host);
+                }
+                catch (Exception error) when (error is UsageException or IOException)
+                {
+                    host.Out.WriteLine($"  couldn't read it: {error.Message}");
+                }
+            }
+            return 0;
+        }
+        catch (UsageException error)
+        {
+            host.Err.WriteLine(error.Message);
+            return 2;
+        }
+    }
+
+    private static void ShowSchedules(JobsConfig settings, string home, DateTime now, CliHost host)
+    {
+        var any = false;
+        foreach (var job in settings.Kinds.Values)
+            for (var n = 0; n < job.Schedules.Count; n++)
+            {
+                any = true;
+                var spec = job.Schedules[n];
+                var last = Schedules.Last(home, settings.Path, job.Name, n);
+                host.Out.WriteLine($"  {job.Name}: {spec}; next {(spec.Next(now) is { } next ? next.ToString("ddd d MMM yyyy HH:mm", CultureInfo.InvariantCulture) : "never")}"
+                                   + (last is { } l ? $"; last started (or switched on) {l.ToString("ddd d MMM yyyy HH:mm", CultureInfo.InvariantCulture)}" : ""));
+            }
+        if (!any)
+            host.Out.WriteLine("  (no job has a [[job.schedule]])");
     }
 
     /// <summary>One job, start to finish. The output already there: nothing to do (unless forced). A usage limit: back
@@ -220,6 +314,20 @@ public static class Cli
             }
             reply = done[^1].Reply;
 
+            // "Not one for me": a SKIP: section (named by `skip`) means no output, and a `skipped` item saying why.
+            if (job.Skip is { } skipName && Jobs.Sections(reply, [(skipName, false)]).TryGetValue(skipName, out var skipLines))
+            {
+                var why = Jobs.Items(skipLines, []);
+                values[skipName] = why.Count > 0 ? why : ["(no reason given)"];
+                log($"job {job.Name}: skipped: {string.Join("; ", (List<string>)values[skipName]!)}");
+                if (outFile is not null)
+                    return 0;
+                if (job.Skipped is { } skipped && settings.ReviewFile is { } skippedFile)
+                    new QueueFile(skippedFile, settings.ReviewLock).Add(skipped.Source, skipped.Type, Fields(skipped, Value));
+                Finish(job, inputPath, work);
+                return 0;
+            }
+
             if (job.Sections.Count > 0)
             {
                 var sections = Jobs.Sections(reply, job.Sections);
@@ -235,6 +343,13 @@ public static class Cli
             foreach (var pattern in job.MustMatch)
                 if (!pattern.IsMatch(bodyText))
                     throw new InvalidDataException($"the reply's {job.Body ?? "text"} doesn't match {pattern}: {PyStr.Head(bodyText, 80)}");
+        }
+        catch (NothingToDoException nothing)
+        {
+            log($"job {job.Name}: nothing to do{(nothing.Message.Length > 0 ? $": {nothing.Message}" : "")}");
+            if (outFile is null)
+                Finish(job, inputPath, work);
+            return 0;
         }
         catch (Exception error) when (error is InvalidDataException or ClaudeRunException or TimeoutException or IOException)
         {
@@ -281,6 +396,7 @@ public static class Cli
         if (tablePath is not null && tableText is not null)
             File.WriteAllText(tablePath, tableText, new UTF8Encoding(false));
 
+        var keptByGit = false;
         if (settings.Git is { Commit: true } git && job.Commit is not null)
         {
             var paths = new List<string> { target };
@@ -292,11 +408,39 @@ public static class Cli
                 paths, trailers: git.Trailers, push: git.Push);
             log(committed.Error is { } e ? $"  commit failed: {e}" : committed.Committed
                 ? $"  committed {committed.Commit}{(git.Push ? committed.Pushed ? ", pushed" : $", push failed: {committed.PushError}" : "")}" : "  nothing to commit");
+            keptByGit = committed.Committed;
+        }
+        // Not committed as written (no git, not a repo, or the commit didn't land): keep a copy outside the folder, so
+        // the draft can still be compared with what was sent once it's been edited.
+        if (!keptByGit && settings.Originals is { } originals)
+        {
+            var relative = Path.GetRelativePath(settings.OriginalsRoot, target);
+            if (relative.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(relative))
+                relative = Path.GetFileName(target);
+            var copy = Path.Combine(originals, relative);
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(copy)!);
+                File.Copy(target, copy, true);
+                log($"  kept the as-written copy: {copy}");
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+            {
+                log($"  couldn't keep the as-written copy: {error.Message}");
+            }
         }
         if (job.Review is { } review && settings.ReviewFile is { } file)
             new QueueFile(file, settings.ReviewLock).Add(review.Source, review.Type, Fields(review, Value));
         if (job.Notify is { } notify)
             host.Notify(Jobs.Fill(notify.Title, Value, single: true)!, [Jobs.Fill(notify.Text, Value)!]);
+        Finish(job, inputPath, work);
+        return 0;
+    }
+
+    /// <summary>A job done (or skipped, or with nothing to do): the input and its attachments deleted (unless the
+    /// settings keep it), and the progress file.</summary>
+    private static void Finish(JobKind job, string inputPath, string work)
+    {
         if (job.DeleteInput)
         {
             File.Delete(inputPath);
@@ -306,7 +450,6 @@ public static class Cli
         }
         if (File.Exists(Progress(work)))
             File.Delete(Progress(work));
-        return 0;
     }
 
     private static void Prepare(PrepareStep step, Func<string, object?> value, JobsConfig settings, CliHost host, Action<string> log, string job)
@@ -321,6 +464,8 @@ public static class Cli
         }
         var argv = step.Run!.Select(a => Jobs.Fill(a, value, single: true)!).Select(a => a.Contains('/') || a.Contains('\\') ? settings.Resolve(a) : a).ToList();
         var (exit, output) = host.RunStep(argv, settings.Dir);
+        if (step.NothingToDoExit is { } nothing && exit == nothing)
+            throw new NothingToDoException(PyStr.Head(output, 300));
         if (exit != 0)
             throw new InvalidDataException($"prepare step {Path.GetFileName(argv[0])} exited {exit}: {PyStr.Head(output, 300)}");
         log($"job {job}: prepared ({Path.GetFileName(argv.Count > 1 ? argv[^1] : argv[0])})");

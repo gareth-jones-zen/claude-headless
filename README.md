@@ -10,9 +10,12 @@ original, for Python scripts that run Claude themselves; both use the same queue
 
 ```
 claude-headless status            the usage limit, if one is in force, and what's queued
-claude-headless run-queue         run queued jobs one at a time, until done or the limit is back
-claude-headless autostart on      run the queue every 15 minutes and at logon (off, status)
-claude-headless --config FILE job KIND --input FILE [--out FILE]
+claude-headless run-queue         queue the scheduled jobs that are due, then run queued jobs one at a time,
+                                  until done or the limit is back
+claude-headless autostart on      run the queue every 15 minutes, at logon and after an unlock (off, status)
+claude-headless --config FILE schedule on|off|status
+                                  whether run-queue starts this settings file's scheduled jobs
+claude-headless --config FILE job KIND --input FILE [--out FILE] [--force]
 ```
 
 Install: unzip `claude-headless-<version>-win-x64.zip` from
@@ -116,6 +119,55 @@ run = ["powershell", "-NoProfile", "-File", "report/deck-to-pdf.ps1", "-InputJso
 prompt = "report/first.md"
 [[job.turn]]
 text = "Now compare with the headlines:\n\n{extract.headlines}"
+```
+
+### Schedules, skips, nothing to do, file names, originals (0.4.0)
+
+- **`[[job.schedule]]`** starts a job by itself: `on` a day rule (`daily`, `weekdays`, a day such as `Wednesday`,
+  `first Wednesday` (first to fourth, or `last`), or `day 1`), `at` a time of day, and any `input` fields. The queue
+  task's run-queue checks the schedules first, so **no task of its own is needed**: when one has fallen due since it
+  last started the job, it writes an input (`{"received": when it was due, "queued": now, "schedule": "first
+  Wednesday 07:30"}` plus the `input` fields) under `%LOCALAPPDATA%\claude-headless\scheduled\` and queues the job,
+  once, however many times it fell due while the laptop was off or asleep. The job's `{date}` is the day it was due.
+- **`claude-headless --config FILE schedule on`** records the settings file beside the queue (`schedules.json`),
+  because the queue task is registered without settings; `off` forgets it, `status` shows each schedule, when it's
+  next due and when it last started its job. A schedule starts from the moment it's switched on: nothing that fell
+  due before then is run. `run-queue --config FILE` also checks that file.
+- **`nothing_to_do_exit`** on a `[[job.prepare]]` `run` step: an exit code meaning "nothing to do this time" (no new
+  data, say). The job ends there with exit 0: no output, no item, the input deleted, Claude never asked. Any other
+  non-zero exit is still a failure.
+- **`skip`** names a reply section that means "not one for me" (`skip = "SKIP"`: Claude replies `SKIP: why`).
+  Then nothing is written, the `skipped` item is added (`{SKIP}` is the reason), and the input is deleted. Put it
+  outside `sections`: a skip reply doesn't need them. With `--out`, a skip is logged and nothing else happens.
+- **`{name:slug}`** makes text a file name part: `RE:`, `FW:` and `FWD:` dropped, lower case, apostrophes dropped,
+  anything else that isn't a letter or digit a hyphen, at most 50 characters (`"RE: Christmas Party - RSVP by
+  27/11!"` is `christmas-party-rsvp-by-27-11`). For an output named after an email's subject.
+- **`originals`** (a top-level setting, a folder) keeps the as-written copy of each output **that isn't committed**:
+  no `[git]`, no `commit` for the job, or a commit that didn't land. So in a folder that isn't a git repo, a draft
+  can still be compared with what was sent after it's been edited. The copy goes at the output's path below
+  `originals_root` (default: the folder above the settings file's), or by its file name if it's outside that.
+  Leave it out where outputs are committed: git keeps the as-written version then.
+
+```toml
+originals = "%LOCALAPPDATA%/my-tools/originals"   # only for a folder that isn't a git repo
+
+[[job]]
+name = "monthly-read"
+output = "../reports/monthly/{date:yyyy-MM}.md"
+# ...
+[[job.prepare]]
+run = ["powershell", "-NoProfile", "-File", "monthly/prepare.ps1", "-Work", "{work}"]
+nothing_to_do_exit = 3                            # no new weeks: no report this month
+[[job.schedule]]
+on = "first Wednesday"
+at = "07:30"
+
+[[job]]
+name = "reminder"
+output = "../chat/{date:yyyy-MM-dd}-{input.subject:slug}.md"
+skip = "SKIP"
+skipped = { source = "chat", type = "skipped", title = "Not a reminder: {input.subject}", reason = "{SKIP}" }
+# ...
 ```
 
 ## The Python package

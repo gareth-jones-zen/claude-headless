@@ -26,8 +26,12 @@ public sealed record TurnSpec(string? PromptFile, string? Text, IReadOnlyList<(s
 /// match), trimmed.</summary>
 public sealed record ExtractSpec(string Name, string? Field, string? File, Regex? Upto, bool Tidy, Regex? After, Regex? Before, Regex? Pattern);
 
-/// <summary>A step before Claude (0.3.0): copy a file, or run a command, each a template.</summary>
-public sealed record PrepareStep(IReadOnlyList<string>? Run, string? Copy, string? To);
+/// <summary>A step before Claude (0.3.0): copy a file, or run a command, each a template. A command that exits with
+/// NothingToDoExit (0.4.0) means there's nothing to do this time: no output, no item, the input deleted.</summary>
+public sealed record PrepareStep(IReadOnlyList<string>? Run, string? Copy, string? To, int? NothingToDoExit = null);
+
+/// <summary>A prepare step said there's nothing to do (0.4.0), with what it said.</summary>
+public sealed class NothingToDoException(string message) : Exception(message);
 
 /// <summary>A table (CSV) a reply adds rows to (0.3.0): the last fenced block in a turn's reply that matches block
 /// (its first group, from the header line on). Rows whose key (the first column) is new are added; existing rows are
@@ -66,6 +70,9 @@ public sealed class JobKind
     public ReviewTemplate? Review { get; init; }
     public ReviewTemplate? Failed { get; init; }
     public bool DeleteInput { get; init; } = true;
+    public string? Skip { get; init; }                                              // a reply section that means "not one for me" (0.4.0)
+    public ReviewTemplate? Skipped { get; init; }
+    public IReadOnlyList<ScheduleSpec> Schedules { get; init; } = [];               // when run-queue starts it by itself (0.4.0)
 }
 
 /// <summary>A queue item to add: source, type, and fields, each a template.</summary>
@@ -74,7 +81,7 @@ public sealed record ReviewTemplate(string Source, string Type, IReadOnlyList<(s
 /// <summary>config/claude-headless.toml: the job kinds, and the shared [git] and [review] they use.</summary>
 public sealed class JobsConfig
 {
-    public static readonly string[] KnownKeys = ["job", "git", "review", "log_file"];
+    public static readonly string[] KnownKeys = ["job", "git", "review", "log_file", "originals", "originals_root"];
 
     public required string Path { get; init; }
     public required string Dir { get; init; }
@@ -83,6 +90,14 @@ public sealed class JobsConfig
     public string? ReviewFile { get; init; }
     public string? ReviewLock { get; init; }
     public string? LogFile { get; init; }
+
+    /// <summary>Where the as-written copy of each output is kept when it isn't committed (0.4.0): for a folder that
+    /// isn't a git repo, so a draft can still be compared with what was sent. Null: not kept.</summary>
+    public string? Originals { get; init; }
+
+    /// <summary>The folder an output's path under Originals is taken relative to (default: the folder above the
+    /// settings file's).</summary>
+    public string OriginalsRoot { get; init; } = "";
 
     /// <summary>A path setting as a full path, relative to the settings file, with ~ and %VARIABLES%.</summary>
     public required Func<string, string> Resolve { get; init; }
@@ -156,7 +171,7 @@ public sealed class JobsConfig
                 var where = $"[[job]] {(t.TryGetValue("name", out var n) ? n : "(no name)")}";
                 string[] keys = ["name", "prompt", "context", "values", "date", "output", "work", "claude", "timeout_minutes", "sections",
                     "body", "must_match", "empty_items", "replace", "frontmatter", "marker", "commit", "commit_body", "review", "failed", "delete_input",
-                    "turn", "extract", "prepare", "fresh_work", "body_template", "table", "commit_also", "notify"];
+                    "turn", "extract", "prepare", "fresh_work", "body_template", "table", "commit_also", "notify", "skip", "skipped", "schedule"];
                 foreach (var key in t.Keys)
                     if (!keys.Contains(key))
                         throw Bad(where, $"has an unknown setting '{key}'");
@@ -196,9 +211,31 @@ public sealed class JobsConfig
                 var prepare = Tables("prepare").Select(p => new PrepareStep(
                     p.TryGetValue("run", out _) ? Texts(p, "run", where) : null,
                     p.TryGetValue("copy", out _) ? Text(p, "copy", where) : null,
-                    p.TryGetValue("to", out _) ? Text(p, "to", where) : null)).ToList();
+                    p.TryGetValue("to", out _) ? Text(p, "to", where) : null,
+                    p.TryGetValue("nothing_to_do_exit", out var nx) ? nx is long nl && nl is >= 1 and <= 255 ? (int)nl
+                        : throw Bad(where, "nothing_to_do_exit should be an exit code, 1 to 255") : null)).ToList();
                 if (prepare.Any(p => (p.Run is null) == (p.Copy is null) || (p.Copy is not null && p.To is null)))
                     throw Bad(where, "each [[job.prepare]] needs run, or copy with to");
+                if (prepare.Any(p => p.NothingToDoExit is not null && p.Run is null))
+                    throw Bad(where, "nothing_to_do_exit goes with a prepare step's run");
+                var schedules = new List<ScheduleSpec>();
+                foreach (var st in Tables("schedule"))
+                {
+                    foreach (var key in st.Keys)
+                        if (key is not ("on" or "at" or "input"))
+                            throw Bad(where, $"[[job.schedule]] has an unknown setting '{key}' (known: on, at, input)");
+                    try
+                    {
+                        schedules.Add(ScheduleSpec.Parse(Text(st, "on", where), Text(st, "at", where), Table(st, "input", where)));
+                    }
+                    catch (FormatException error)
+                    {
+                        throw Bad(where, error.Message);
+                    }
+                }
+                var skip = t.TryGetValue("skip", out _) ? Text(t, "skip", where) : null;
+                if (skip is not null && sections.Any(s => s.Item1 == skip))
+                    throw Bad(where, $"skip '{skip}' shouldn't also be one of its sections");
                 TableSpec? tableSpec = null;
                 if (t.TryGetValue("table", out var tb))
                 {
@@ -242,6 +279,9 @@ public sealed class JobsConfig
                     Review = Review(t, "review", where),
                     Failed = Review(t, "failed", where),
                     DeleteInput = !t.TryGetValue("delete_input", out var di) || (di is bool b ? b : throw Bad(where, "delete_input should be true or false")),
+                    Skip = skip,
+                    Skipped = Review(t, "skipped", where),
+                    Schedules = schedules,
                 };
             }
         }
@@ -265,10 +305,14 @@ public sealed class JobsConfig
             reviewFile = r.TryGetValue("file", out var f) && f is string { Length: > 0 } fs ? Resolve(fs) : throw new UsageException($"{full}: [review] needs file.");
             reviewLock = r.TryGetValue("lock", out var l) && l is string ls ? ls : null;
         }
+        string? Optional(string key) => !raw.TryGetValue(key, out var v) ? null
+            : v is string { Length: > 0 } s ? Resolve(s) : throw new UsageException($"{full}: {key} should be text, and not empty.");
         return new JobsConfig
         {
             Path = full, Dir = dir, Kinds = kinds, Git = git, ReviewFile = reviewFile, ReviewLock = reviewLock, Resolve = Resolve,
             LogFile = raw.TryGetValue("log_file", out var lf) && lf is string { Length: > 0 } lfs ? Resolve(lfs) : null,
+            Originals = Optional("originals"),
+            OriginalsRoot = Optional("originals_root") ?? System.IO.Path.GetDirectoryName(dir) ?? dir,
         };
     }
 }
@@ -296,7 +340,7 @@ public static partial class Jobs
                 return "}";
             var v = value(m.Groups[1].Value.Trim());
             var format = m.Groups[2].Success ? m.Groups[2].Value : null;
-            var shown = v switch
+            var shown = format == "slug" ? Slug(v is IEnumerable<string> words ? string.Join(" ", words) : v?.ToString() ?? "") : v switch
             {
                 null => "",
                 DateTimeOffset at => at.DateTime.ToString(format ?? "yyyy-MM-dd", CultureInfo.InvariantCulture),
@@ -313,6 +357,25 @@ public static partial class Jobs
             return shown;
         });
         return optional && empty ? null : text;
+    }
+
+    /// <summary>{name:slug} (0.4.0): text as a file name part. Reply and forward prefixes (RE:, FW:, FWD:) dropped,
+    /// lower case, apostrophes dropped, anything not a letter or digit a hyphen, at most 50 characters (cut at a
+    /// hyphen where there's one in the last half). Nothing left: "untitled".</summary>
+    public static string Slug(string text)
+    {
+        var s = Regex.Replace(text, @"^(\s*(re|fw|fwd|aw|wg)\s*:)+", "", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        s = Regex.Replace(s.ToLowerInvariant(), "['\u2018\u2019]", "");
+        s = Regex.Replace(s, "[^a-z0-9]+", "-").Trim('-');
+        if (s.Length > 50)
+        {
+            s = s[..50];
+            var cut = s.LastIndexOf('-');
+            if (cut >= 25)
+                s = s[..cut];
+            s = s.Trim('-');
+        }
+        return s.Length > 0 ? s : "untitled";
     }
 
     internal static DateTimeOffset? Iso(string text) =>
