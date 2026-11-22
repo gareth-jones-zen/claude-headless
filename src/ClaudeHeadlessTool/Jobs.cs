@@ -7,6 +7,7 @@ using PyCompat;
 using RepoCommit;
 using Tomlyn;
 using Tomlyn.Model;
+using WinBackground;
 
 namespace ClaudeHeadlessTool;
 
@@ -81,7 +82,15 @@ public sealed record ReviewTemplate(string Source, string Type, IReadOnlyList<(s
 /// <summary>config/claude-headless.toml: the job kinds, and the shared [git] and [review] they use.</summary>
 public sealed class JobsConfig
 {
-    public static readonly string[] KnownKeys = ["job", "git", "review", "log_file", "originals", "originals_root"];
+    public static readonly string[] KnownKeys = ["job", "git", "review", "log_file", "originals", "originals_root", "schedule"];
+
+    /// <summary>The queue task's schedule when the settings say nothing (0.5.0): every 15 minutes, at logon, and a minute after
+    /// each unlock, so jobs that waited while the laptop slept start at once (GJ, 19 Nov 2026).</summary>
+    public static readonly ScheduleSettings DefaultSchedule = new() { EveryMinutes = 15, AtLogon = true, AfterUnlockMinutes = 1 };
+
+    /// <summary>[schedule] (0.5.0): the queue task's triggers, background-tools-lib's shared keys. The task runs run-queue with
+    /// no settings file, so the keys a run would check (hours, days, end_date) aren't accepted here.</summary>
+    public ScheduleSettings Schedule { get; init; } = DefaultSchedule;
 
     public required string Path { get; init; }
     public required string Dir { get; init; }
@@ -313,7 +322,28 @@ public sealed class JobsConfig
             LogFile = raw.TryGetValue("log_file", out var lf) && lf is string { Length: > 0 } lfs ? Resolve(lfs) : null,
             Originals = Optional("originals"),
             OriginalsRoot = Optional("originals_root") ?? System.IO.Path.GetDirectoryName(dir) ?? dir,
+            Schedule = ReadSchedule(raw, full),
         };
+    }
+
+    /// <summary>The [schedule] table, or the defaults. Strict: an unknown or unsupported key is an error.</summary>
+    public static ScheduleSettings ReadSchedule(TomlTable raw, string full)
+    {
+        if (!raw.TryGetValue("schedule", out var s))
+            return DefaultSchedule;
+        if (s is not TomlTable table)
+            throw new UsageException($"{full}: [schedule] should be a table (every_minutes, at_logon, after_unlock_minutes).");
+        foreach (var key in new[] { "hours", "days", "end_date" })
+            if (table.ContainsKey(key))
+                throw new UsageException($"{full}: [schedule] {key} isn't used by claude-headless: the queue task runs whenever it's due.");
+        try
+        {
+            return ScheduleSettings.Parse(table, DefaultSchedule, TaskKind.Job, $"{full}: [schedule]");
+        }
+        catch (FormatException error)
+        {
+            throw new UsageException(error.Message.TrimEnd());
+        }
     }
 }
 

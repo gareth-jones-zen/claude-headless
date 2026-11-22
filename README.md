@@ -12,11 +12,31 @@ original, for Python scripts that run Claude themselves; both use the same queue
 claude-headless status            the usage limit, if one is in force, and what's queued
 claude-headless run-queue         queue the scheduled jobs that are due, then run queued jobs one at a time,
                                   until done or the limit is back
-claude-headless autostart on      run the queue every 15 minutes, at logon and after an unlock (off, status)
+claude-headless --config FILE autostart on
+                                  register the queue task from [schedule] (below); off; status
 claude-headless --config FILE schedule on|off|status
                                   whether run-queue starts this settings file's scheduled jobs
 claude-headless --config FILE job KIND --input FILE [--out FILE] [--force]
 ```
+
+### [schedule]: when the queue task runs
+
+The queue task's triggers are a `[schedule]` table, background-tools-lib's shared keys (WinBackground's
+`ScheduleSettings`), so every tool spells its schedule the same way:
+
+```toml
+[schedule]
+every_minutes = 15          # how often the task runs the queue
+at_logon = true             # also at logon
+after_unlock_minutes = 1    # and this long after each unlock (0: not at unlock), so jobs that waited while the laptop
+                            # slept start at once
+```
+
+Those three are the defaults, with no `[schedule]` and with no `--config`. `daily_at` works too (with
+`every_minutes = 0`). `hours`, `days` and `end_date` aren't accepted: the task runs `run-queue` with no settings file,
+so a run can't check them, and the queue runs whenever it's due. **A change takes effect when you run `autostart on`
+again**: the registered task records its schedule, and `autostart status` says when the settings no longer match it.
+The old `--every N` and `--after-unlock N` flags still work, but not together with the same key in `[schedule]`.
 
 Install: unzip `claude-headless-<version>-win-x64.zip` from
 [Releases](https://github.com/gareth-jones-zen/claude-headless/releases) to a folder that will stay put, such as
@@ -191,7 +211,7 @@ except LimitReached as limit:
 
 ```
 pip install git+https://github.com/gareth-jones-zen/win-background git+https://github.com/gareth-jones-zen/claude-headless
-claude-headless autostart on      # run the queue every 15 minutes and at logon (Windows)
+claude-headless --config FILE autostart on   # run the queue from [schedule] (Windows)
 ```
 
 Needs Claude Code installed and signed in (`claude` on the PATH), and Python 3.11+.

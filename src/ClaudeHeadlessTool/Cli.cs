@@ -39,6 +39,12 @@ public sealed class CliHost
 
     /// <summary>The command line that queued this run, for putting it back on the queue after a usage limit.</summary>
     public Func<IReadOnlyList<string>> Self { get; init; } = () => [Environment.ProcessPath ?? "claude-headless.exe", .. Environment.GetCommandLineArgs().Skip(1)];
+
+    /// <summary>The queue task (0.5.0: autostart is handled here, from the settings' [schedule]).</summary>
+    public Func<ITask> Task { get; init; } = () => new ScheduledTask(HeadlessCli.TaskName, HeadlessCli.TaskDescription);
+
+    /// <summary>The windowless program the queue task runs.</summary>
+    public Func<string> BackgroundExe { get; init; } = () => Path.Combine(AppContext.BaseDirectory, "claude-headless-background.exe");
 }
 
 /// <summary>claude-headless: the seat's queue of Claude Code jobs (status, run-queue, autostart: background-tools-lib's
@@ -51,7 +57,9 @@ public static class Cli
         "    claude-headless status          the limit, if one is in force, and what's queued\n" +
         "    claude-headless run-queue       queue any scheduled jobs that are due, then run queued jobs one at a time,\n" +
         "                                    until done or the limit is back\n" +
-        "    claude-headless autostart on    run the queue every 15 minutes (Task Scheduler); off, status\n" +
+        "    claude-headless --config FILE autostart on\n" +
+        "                                    register the queue task from the settings' [schedule] (by default every 15\n" +
+        "                                    minutes, at logon and a minute after each unlock); off; status\n" +
         "    claude-headless --config FILE schedule on|off|status\n" +
         "                                    whether run-queue starts this settings file's scheduled jobs\n" +
         "    claude-headless --config FILE job KIND --input FILE\n" +
@@ -89,6 +97,8 @@ public static class Cli
         }
         if (args.Count > 0 && args[0] == "schedule")
             return Schedule(args.Skip(1).ToList(), config, host);
+        if (args.Count > 0 && args[0] == "autostart")
+            return Autostart(args.Skip(1).ToList(), config, host);
         if (args.Count == 1 && args[0] == "run-queue")
         {
             // The scheduled jobs that are due go on the queue first, so this run starts them.
@@ -144,6 +154,125 @@ public static class Cli
             host.Err.WriteLine($"{error.GetType().Name}: {error.Message}");
             return 1;
         }
+    }
+
+    /// <summary>autostart on|off|status (0.5.0): the queue task, built from the settings' [schedule] (background-tools-lib's
+    /// shared keys; with no --config, or no [schedule], every 15 minutes, at logon and a minute after each unlock). The
+    /// old --every and --after-unlock flags still work, but not together with the same key in [schedule].</summary>
+    private static int Autostart(List<string> args, string? config, CliHost host)
+    {
+        int? every = null, afterUnlock = null;
+        string? action = null;
+        for (var i = 0; i < args.Count; i++)
+        {
+            if (args[i] == "--every" && i + 1 < args.Count && int.TryParse(args[i + 1], out var minutes) && minutes >= 1)
+            {
+                every = minutes;
+                i++;
+            }
+            else if (args[i].StartsWith("--every=", StringComparison.Ordinal) && int.TryParse(args[i][8..], out var m) && m >= 1)
+                every = m;
+            else if (args[i] == "--after-unlock" && i + 1 < args.Count && int.TryParse(args[i + 1], out var u) && u >= 0)
+            {
+                afterUnlock = u;
+                i++;
+            }
+            else if (action is null && args[i] is "on" or "off" or "status")
+                action = args[i];
+            else
+                return Bad(host, $"unrecognized arguments: {args[i]}");
+        }
+        if (action is null)
+            return Bad(host, "the following arguments are required: action");
+        ScheduleSettings schedule;
+        try
+        {
+            schedule = JobsConfig.DefaultSchedule;
+            Tomlyn.Model.TomlTable? table = null;
+            if (config is not null)
+            {
+                var settings = JobsConfig.Load(config, host.Env);
+                schedule = settings.Schedule;
+                table = ReadScheduleTable(settings.Path);
+            }
+            if (every is { } e)
+            {
+                if (table?.ContainsKey("every_minutes") == true)
+                    throw new UsageException("--every and [schedule] every_minutes both set: use [schedule] (--every is the old way).");
+                schedule = schedule with { EveryMinutes = e };
+            }
+            if (afterUnlock is { } a)
+            {
+                if (table?.ContainsKey("after_unlock_minutes") == true)
+                    throw new UsageException("--after-unlock and [schedule] after_unlock_minutes both set: use [schedule] (--after-unlock is the old way).");
+                schedule = schedule with { AfterUnlockMinutes = a };
+            }
+            schedule.Validate(TaskKind.Job);
+        }
+        catch (UsageException error)
+        {
+            host.Err.WriteLine(error.Message);
+            return 2;
+        }
+        catch (FormatException error)
+        {
+            host.Err.WriteLine(error.Message.TrimEnd());
+            return 2;
+        }
+        var task = host.Task();
+        switch (action)
+        {
+            case "on":
+                var line = task.Enable(host.BackgroundExe(), ["run-queue"], null, schedule.ToTaskSchedule(TaskKind.Job, TimeSpan.FromHours(4)));
+                host.Out.WriteLine($"Autostart is on: '{task.Name}' {Describe(schedule)}.");
+                host.Out.WriteLine($"  {line}");
+                return 0;
+            case "off":
+                host.Out.WriteLine(task.Disable() ? "Autostart is off." : "Autostart was already off.");
+                return 0;
+            default:
+                var info = task.Status();
+                if (info is null)
+                {
+                    host.Out.WriteLine("Autostart is off.");
+                    return 0;
+                }
+                host.Out.WriteLine($"Autostart is on ('{task.Name}').");
+                foreach (var key in new[] { "state", "last_run", "last_result", "next_run" })
+                    host.Out.WriteLine($"  {key.Replace('_', ' '),-12} {info.GetValueOrDefault(key, "")}");
+                if (ScheduleDrift.Advice(ScheduleDrift.Check(info, schedule.Fingerprint(TaskKind.Job)), "claude-headless") is { } advice)
+                    host.Out.WriteLine($"  {advice}");
+                return 0;
+        }
+    }
+
+    /// <summary>The settings file's own [schedule] table (not the base's), to tell a key set there from a default.</summary>
+    private static Tomlyn.Model.TomlTable? ReadScheduleTable(string path)
+    {
+        var text = PyStr.ReadText(path);
+        if (text.StartsWith('﻿'))
+            text = text[1..];
+        return PyToml.Read(text, path).TryGetValue("schedule", out var s) ? s as Tomlyn.Model.TomlTable : null;
+    }
+
+    /// <summary>"runs every 15 minutes, at logon and 1 minute(s) after each unlock".</summary>
+    private static string Describe(ScheduleSettings s)
+    {
+        var parts = new List<string>();
+        if (s.EveryMinutes is > 0 and var m)
+            parts.Add($"runs every {m} minutes");
+        else if (s.DailyAt is { } d)
+            parts.Add($"runs daily at {d}");
+        if (s.AtLogon)
+            parts.Add("at logon");
+        if (s.AfterUnlockMinutes > 0)
+            parts.Add($"{s.AfterUnlockMinutes} minute(s) after each unlock");
+        return parts.Count switch
+        {
+            0 => "is registered",
+            1 => parts[0],
+            _ => string.Join(", ", parts[..^1]) + " and " + parts[^1],
+        };
     }
 
     private static int Bad(CliHost host, string message)
