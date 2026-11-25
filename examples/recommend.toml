@@ -1,0 +1,90 @@
+# recommend: a recommendation, with reasons, written onto review-queue items that have none (0.6.0).
+#
+# For a page or tool that shows the review queue as decisions, each with a recommendation the person can take with one
+# key: for the kinds of item that arrive without one, it writes the input (the items, as `review-queue list --json`
+# gives them) and runs `claude-headless --config config/claude-headless.toml queue recommend --input <file> --now`.
+# Claude reads the folder (read only: no edits, no commands), and replies with a recommendation and reasons for each
+# item, or why it can't recommend; review-queue update writes them onto the items. Nothing else is done to an item:
+# it isn't marked done, answered or acted on. An item that has a recommendation by then (or has gone) is left alone:
+# the update only matches an item with none. A receipt is written outside the folder; nothing is committed.
+#
+# The input (JSON): {"items": [...]}, the list `review-queue list --json` prints (each item with its "guide"), such as
+#   {"items": [{"id": "67a99c5e", "source": "ev", "type": "question", "added": "2026-11-18T10:00:00",
+#               "title": "Wed 25 Nov: work plan says office, no Travel block", "guide": "Raise each question, then mark it done."}]}
+# Send only items with neither "recommendation" nor "no_recommendation".
+#
+# What it writes onto an item (review-queue update --set):
+#   recommendation  one imperative sentence: "Mark it done: the new row matches the deck"
+#   reasons         a list of one to three short reasons, each naming the file or fact it rests on
+#   recommended_by  "claude-headless job recommend, <date>"
+# or, where it can't recommend, no_recommendation (why) and recommended_by.
+#
+# Paste the [[job]] below into the settings file (config/claude-headless.toml), after [git] and [review], and set
+# values.owner (a first name).
+
+[[job]]
+name = "recommend"
+values = { owner = "Alex" }
+output = "%EA_LOCAL%/claude-headless/recommend/{input.name}.md"   # the receipt, outside the folder
+work = ".."                               # the folder itself (this file is in config/), read only
+claude = ["-p", "--output-format", "json", "--model", "opus", "--tools", "Read,Glob,Grep", "--restricted",
+          "--strict-mcp-config", "--permission-mode", "dontAsk", "--allowedTools", "Read,Glob,Grep"]
+timeout_minutes = 20
+sections = ["RECOMMENDATIONS", "CANNOT?"]
+frontmatter = [
+  "recommended: {recommended.applied:json}",
+  "not-written: {recommended.failed:json}",
+  "cannot-recommend: {cannot.applied:json}",
+  "cannot-not-written: {cannot.failed:json}",
+  "written: {today:json}",
+]
+failed = { source = "recommend", type = "failed", title = "Couldn't recommend on the review queue's items", error = "{error}", saved = "{input.path}", rerun = "claude-headless --config config/claude-headless.toml job recommend --input {input.path}" }
+
+# Written with review-queue update, matching the item's id and no recommendation yet: "1" (one item changed) is done;
+# "0" means it has one by now, or it's gone, and is listed as not written.
+[[job.each]]
+name = "recommended"
+section = "RECOMMENDATIONS"
+label = "{item.id}"
+run = ["%LOCALAPPDATA%/Programs/review-queue/review-queue.exe", "--config", "review-queue.toml", "update", "{item.source}",
+       "--match", '{{"id": {item.id:json}, "recommendation": null}}',
+       "--set", '{{"recommendation": {item.recommendation:json}, "reasons": {item.reasons:json}, "recommended_by": "claude-headless job recommend, {today}"}}']
+applied_if = '\A[1-9]'
+[[job.each]]
+name = "cannot"
+section = "CANNOT"
+label = "{item.id}"
+run = ["%LOCALAPPDATA%/Programs/review-queue/review-queue.exe", "--config", "review-queue.toml", "update", "{item.source}",
+       "--match", '{{"id": {item.id:json}, "recommendation": null}}',
+       "--set", '{{"no_recommendation": {item.why:json}, "recommended_by": "claude-headless job recommend, {today}"}}']
+applied_if = '\A[1-9]'
+
+[[job.turn]]
+text = '''This is an unattended background job, not a session with {value.owner}: skip any session-start routine (no
+briefing), ask no questions, run nothing and change nothing: you can only read.
+
+These items are waiting in {value.owner}'s review queue with no recommendation (JSON, as `review-queue list --json`
+gives them: each has its id, source, type, title and other fields, and `guide`, {value.owner}'s standing instruction
+for that kind of item):
+
+{input.items}
+
+For each, recommend what {value.owner} should do, so they can agree with one key or correct it:
+- Read what the guide points to, and what the item names (a file, a summary, a list item), as far as you need to
+  judge it. The folder's CLAUDE.md and rules say how things are done here. Today is {today:dddd d MMMM yyyy}.
+- The recommendation: one short imperative sentence, the action decided ("Mark it done: the new row matches the
+  deck"; "Ask Ann about the tag list in Thursday's catch-up"; "Approve it: Sam covers that week"). Never send, post or
+  answer anything for them, and never an action only a later session could take unasked.
+- The reasons: one to three short ones, each naming the file or fact it rests on.
+- If you can't recommend (it turns on {value.owner}'s judgement about something the folder doesn't show), say why
+  instead, in a line.
+
+Never add a need-to-know code name, or personnel detail, that the item doesn't already carry.
+
+Reply in exactly this shape, with nothing before it: one JSON object a line, and "none" for a section with nothing in it.
+
+RECOMMENDATIONS:
+{{"id": "67a99c5e", "source": "ev", "recommendation": "Mark it done: ...", "reasons": ["...", "..."]}}
+CANNOT:
+{{"id": "0b1c2d3e", "source": "transcripts", "why": "..."}}
+'''

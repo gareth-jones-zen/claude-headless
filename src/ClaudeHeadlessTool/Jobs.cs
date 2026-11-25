@@ -39,6 +39,12 @@ public sealed class NothingToDoException(string message) : Exception(message);
 /// never changed: where the reply's copy differs, the difference is reported ({table.changes}) for a person to decide.</summary>
 public sealed record TableSpec(string File, int Turn, Regex Block);
 
+/// <summary>A reply's items applied through a command (0.6.0): each line of a reply section is a JSON object, and `run`
+/// is run once for each, with {item.FIELD} from it (an argument ending "?" is left out when anything in it is empty).
+/// A non-zero exit, or output that doesn't match AppliedIf, counts it as not applied; the rest go on. Label names an
+/// item in {NAME.applied} and {NAME.failed} (default: its line).</summary>
+public sealed record EachSpec(string Name, string Section, IReadOnlyList<string> Run, Regex? AppliedIf, string? Label);
+
 /// <summary>One [[job]] kind: take an input, give it to Claude with a prompt, check the reply, put the output here.</summary>
 public sealed class JobKind
 {
@@ -74,10 +80,17 @@ public sealed class JobKind
     public string? Skip { get; init; }                                              // a reply section that means "not one for me" (0.4.0)
     public ReviewTemplate? Skipped { get; init; }
     public IReadOnlyList<ScheduleSpec> Schedules { get; init; } = [];               // when run-queue starts it by itself (0.4.0)
+    public IReadOnlyList<EachSpec> Each { get; init; } = [];                        // a reply's items applied through a command (0.6.0)
+
+    /// <summary>A job that edits files where they are (0.6.0): the repository paths (globs) that the files Claude and the
+    /// each-steps change may be in. What changed in them during the run is committed, and nothing else; the output is
+    /// then a receipt, written after the commit.</summary>
+    public IReadOnlyList<string> CommitChanged { get; init; } = [];
 }
 
-/// <summary>A queue item to add: source, type, and fields, each a template.</summary>
-public sealed record ReviewTemplate(string Source, string Type, IReadOnlyList<(string Key, string Value)> Fields);
+/// <summary>A queue item to add: source, type, and fields, each a template. OnlyIf (0.6.0): the item is added only
+/// when this template comes out non-empty (so "{NOT APPLIED}" adds it only when something wasn't).</summary>
+public sealed record ReviewTemplate(string Source, string Type, IReadOnlyList<(string Key, string Value)> Fields, string? OnlyIf = null);
 
 /// <summary>config/claude-headless.toml: the job kinds, and the shared [git] and [review] they use.</summary>
 public sealed class JobsConfig
@@ -165,9 +178,10 @@ public sealed class JobsConfig
                 return null;
             if (v is not TomlTable r)
                 throw Bad(where, $"{key} should be a table: source, type, title and any other fields");
-            var fields = r.Where(kv => kv.Key is not ("source" or "type")).Select(kv =>
+            var fields = r.Where(kv => kv.Key is not ("source" or "type" or "only_if")).Select(kv =>
                 (kv.Key, kv.Value as string ?? throw Bad(where, $"{key}.{kv.Key} should be text"))).ToList();
-            return new ReviewTemplate(Text(r, "source", $"{where} {key}"), Text(r, "type", $"{where} {key}"), fields);
+            return new ReviewTemplate(Text(r, "source", $"{where} {key}"), Text(r, "type", $"{where} {key}"), fields,
+                r.TryGetValue("only_if", out _) ? Text(r, "only_if", $"{where} {key}") : null);
         }
 
         var kinds = new Dictionary<string, JobKind>(StringComparer.Ordinal);
@@ -180,7 +194,8 @@ public sealed class JobsConfig
                 var where = $"[[job]] {(t.TryGetValue("name", out var n) ? n : "(no name)")}";
                 string[] keys = ["name", "prompt", "context", "values", "date", "output", "work", "claude", "timeout_minutes", "sections",
                     "body", "must_match", "empty_items", "replace", "frontmatter", "marker", "commit", "commit_body", "review", "failed", "delete_input",
-                    "turn", "extract", "prepare", "fresh_work", "body_template", "table", "commit_also", "notify", "skip", "skipped", "schedule"];
+                    "turn", "extract", "prepare", "fresh_work", "body_template", "table", "commit_also", "notify", "skip", "skipped", "schedule",
+                    "each", "commit_changed"];
                 foreach (var key in t.Keys)
                     if (!keys.Contains(key))
                         throw Bad(where, $"has an unknown setting '{key}'");
@@ -254,6 +269,31 @@ public sealed class JobsConfig
                         tt.TryGetValue("turn", out var tn) ? tn is long ln && ln >= 1 ? (int)ln : throw Bad(where, "table.turn should be 1 or more") : 1,
                         Rx(tt, "block") ?? throw Bad(where, "table needs block, a pattern for the fenced block"));
                 }
+                var each = new List<EachSpec>();
+                foreach (var et in Tables("each"))
+                {
+                    foreach (var key in et.Keys)
+                        if (key is not ("name" or "section" or "run" or "applied_if" or "label"))
+                            throw Bad(where, $"[[job.each]] has an unknown setting '{key}' (known: name, section, run, applied_if, label)");
+                    var spec = new EachSpec(Text(et, "name", where), Text(et, "section", where), Texts(et, "run", where), Rx(et, "applied_if"),
+                        et.TryGetValue("label", out _) ? Text(et, "label", where) : null);
+                    if (spec.Run.Count == 0)
+                        throw Bad(where, $"[[job.each]] {spec.Name} needs run, a command");
+                    if (!sections.Any(s => s.Item1 == spec.Section))
+                        throw Bad(where, $"[[job.each]] {spec.Name}: section '{spec.Section}' isn't one of its sections");
+                    if (spec.Section == body)
+                        throw Bad(where, $"[[job.each]] {spec.Name}: section '{spec.Section}' is the body");
+                    if (each.Any(e => e.Name == spec.Name))
+                        throw Bad(where, $"has two [[job.each]] called {spec.Name}");
+                    each.Add(spec);
+                }
+                var commitChanged = Texts(t, "commit_changed", where);
+                if (commitChanged.Count > 0 && !t.ContainsKey("commit"))
+                    throw Bad(where, "commit_changed needs commit, the message");
+                if (commitChanged.Count > 0 && (tableSpec is not null || t.ContainsKey("commit_also")))
+                    throw Bad(where, "commit_changed commits what changed: it doesn't go with table or commit_also");
+                if (commitChanged.Count > 0 && t.TryGetValue("fresh_work", out var cfw) && cfw is true)
+                    throw Bad(where, "commit_changed edits files where they are: fresh_work would empty the folder");
                 (string, string)? notify = null;
                 if (t.TryGetValue("notify", out var no))
                     notify = no is TomlTable nt ? (Text(nt, "title", where), Text(nt, "text", where)) : throw Bad(where, "notify should be a table: title, text");
@@ -291,6 +331,8 @@ public sealed class JobsConfig
                     Skip = skip,
                     Skipped = Review(t, "skipped", where),
                     Schedules = schedules,
+                    Each = each,
+                    CommitChanged = commitChanged,
                 };
             }
         }
@@ -370,7 +412,8 @@ public static partial class Jobs
                 return "}";
             var v = value(m.Groups[1].Value.Trim());
             var format = m.Groups[2].Success ? m.Groups[2].Value : null;
-            var shown = format == "slug" ? Slug(v is IEnumerable<string> words ? string.Join(" ", words) : v?.ToString() ?? "") : v switch
+            var shown = format == "slug" ? Slug(v is IEnumerable<string> words ? string.Join(" ", words) : v?.ToString() ?? "")
+                : format == "json" ? Json(v) : v switch
             {
                 null => "",
                 DateTimeOffset at => at.DateTime.ToString(format ?? "yyyy-MM-dd", CultureInfo.InvariantCulture),
@@ -387,6 +430,60 @@ public static partial class Jobs
             return shown;
         });
         return optional && empty ? null : text;
+    }
+
+    /// <summary>{name:json} (0.6.0): a value as JSON, for a command that takes JSON: text as a JSON string, a list as an
+    /// array of strings, a JSON value as it is, nothing as null.</summary>
+    public static string Json(object? value) => value switch
+    {
+        null => "null",
+        JsonNode node => node.ToJsonString(Readable),
+        IEnumerable<string> list => new JsonArray(list.Select(x => (JsonNode?)JsonValue.Create(x)).ToArray()).ToJsonString(Readable),
+        DateOnly day => JsonValue.Create(day.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)).ToJsonString(Readable),
+        _ => JsonValue.Create(value.ToString() ?? "").ToJsonString(Readable),
+    };
+
+    /// <summary>JSON as a person would write it: quotes, apostrophes and accents as they are (only what JSON needs is
+    /// escaped), so a receipt or a command's argument reads plainly.</summary>
+    private static readonly JsonSerializerOptions Readable = new() { Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
+
+    /// <summary>An item's field for {item.FIELD} (0.6.0): text as text, a list of text as a list, anything else as JSON;
+    /// missing: null.</summary>
+    public static object? ItemField(JsonObject item, string name) => item[name] switch
+    {
+        null => null,
+        JsonValue v when v.TryGetValue<string>(out var s) => s,
+        JsonArray a when a.All(x => x is JsonValue xv && xv.TryGetValue<string>(out _)) => a.Select(x => x!.GetValue<string>()).ToList(),
+        var node => node,
+    };
+
+    /// <summary>A repository path glob (0.6.0) as a pattern: ** any folders (or none), * anything but a slash, ? one
+    /// character but a slash; matched without regard to case, with forward slashes.</summary>
+    public static Regex Glob(string glob)
+    {
+        var pattern = new StringBuilder("^");
+        var g = glob.Replace('\\', '/').TrimStart('/');
+        for (var i = 0; i < g.Length; i++)
+        {
+            if (g[i] == '*' && i + 1 < g.Length && g[i + 1] == '*')
+            {
+                i++;
+                if (i + 1 < g.Length && g[i + 1] == '/')
+                {
+                    i++;
+                    pattern.Append("(?:.*/)?");
+                }
+                else
+                    pattern.Append(".*");
+            }
+            else if (g[i] == '*')
+                pattern.Append("[^/]*");
+            else if (g[i] == '?')
+                pattern.Append("[^/]");
+            else
+                pattern.Append(Regex.Escape(g[i].ToString()));
+        }
+        return new Regex(pattern.Append('$').ToString(), RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
     }
 
     /// <summary>{name:slug} (0.4.0): text as a file name part. Reply and forward prefixes (RE:, FW:, FWD:) dropped,

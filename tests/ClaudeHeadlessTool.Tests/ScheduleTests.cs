@@ -29,9 +29,20 @@ public sealed class ScheduleTests : IDisposable
             return $"{exe} {string.Join(' ', args)}";
         }
         public bool Disable() => Registered is not null;
-        public bool Stop() => true;
+        public string State = "Ready";
+        public int Starts, Stops;
+        public bool Stop()
+        {
+            Stops++;
+            return true;
+        }
+        public bool Start()
+        {
+            Starts++;
+            return Registered is not null;
+        }
         public IReadOnlyDictionary<string, string>? Status() => Registered is null ? null
-            : new Dictionary<string, string> { ["state"] = "Ready", ["description"] = Description ?? "" };
+            : new Dictionary<string, string> { ["state"] = State, ["description"] = Description ?? "" };
     }
 
     private string Settings(string schedule)
@@ -95,5 +106,22 @@ public sealed class ScheduleTests : IDisposable
         Assert.DoesNotContain("settings changed", Run("--config", Settings(""), "autostart", "status").Out);
         Assert.Contains("settings changed since this task was registered: run `claude-headless autostart on`",
             Run("--config", Settings("[schedule]\nafter_unlock_minutes = 0\n"), "autostart", "status").Out);
+    }
+
+    [Fact]
+    public void Restart_starts_the_queue_task_but_never_stops_a_run_in_progress()
+    {
+        Assert.Contains("nothing to restart", Run("autostart", "restart").Out);
+        Run("--config", Settings(""), "autostart", "on");
+        var (exit, output, _) = Run("autostart", "restart");
+        Assert.Equal(0, exit);
+        Assert.Contains("Started 'claude-headless run-queue' now", output);
+        Assert.Equal(1, task.Starts);
+
+        task.State = "Running";   // a job under way: left to finish with the version it started with
+        (exit, output, _) = Run("autostart", "restart");
+        Assert.Equal(0, exit);
+        Assert.Contains("is running the queue now", output);
+        Assert.Equal((1, 0), (task.Starts, task.Stops));
     }
 }

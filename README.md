@@ -13,10 +13,14 @@ claude-headless status            the usage limit, if one is in force, and what'
 claude-headless run-queue         queue the scheduled jobs that are due, then run queued jobs one at a time,
                                   until done or the limit is back
 claude-headless --config FILE autostart on
-                                  register the queue task from [schedule] (below); off; status
+                                  register the queue task from [schedule] (below); off; status;
+                                  restart: run the queue now with this version, after an upgrade (0.6.0; a run
+                                  in progress is left to finish, never stopped)
 claude-headless --config FILE schedule on|off|status
                                   whether run-queue starts this settings file's scheduled jobs
 claude-headless --config FILE job KIND --input FILE [--out FILE] [--force]
+claude-headless --config FILE queue KIND --input FILE [--now]
+                                  put a job on the queue for the runner (0.6.0); --now starts the runner
 ```
 
 ### [schedule]: when the queue task runs
@@ -188,6 +192,67 @@ output = "../chat/{date:yyyy-MM-dd}-{input.subject:slug}.md"
 skip = "SKIP"
 skipped = { source = "chat", type = "skipped", title = "Not a reminder: {input.subject}", reason = "{SKIP}" }
 # ...
+```
+
+### Jobs that work in the folder: each-steps, commit_changed, only_if, queue (0.6.0)
+
+Some jobs act on the folder rather than drafting a new file: finalising a meeting summary with the owner's answers, or
+writing recommendations onto review-queue items. **[`examples/`](examples/) has two, ready to paste into a settings
+file** (each with its input and what it writes): `finalise-summary.toml` and `recommend.toml`.
+
+- **`work = ".."`** runs Claude in the folder itself (the settings file being in `config/`), so it reads the
+  folder's `CLAUDE.md` and rules. **Restrict it with Claude Code's own flags**: `--tools` for which tools exist,
+  `--restricted` (no settings files, hooks or command tools; file tools confined to the folder),
+  `--permission-mode dontAsk` (anything not allowed is refused) and `--allowedTools` for what it may do
+  (`Edit(meetings/**/summaries/**)`: paths relative to the folder). `fresh_work` is refused for a folder holding a
+  git repository.
+- **`[[job.each]]`** applies a reply's items through a command, so Claude never runs one: each line of the reply's
+  `section` is a JSON object (`none` for none; a code fence, a trailing comma or a JSON list on a line are fine), and
+  `run` is run once for each, in the settings' folder, with **`{item.FIELD}`** from it. An argument ending `?` is left
+  out when anything in it is empty (`"--section={item.section}?"`); only the program (the first argument) is taken as
+  a path. **`{x:json}`** writes a value as JSON, for a command that takes JSON (`'{{"id": {item.id:json}}}'`). A
+  non-zero exit, or output that doesn't match **`applied_if`** (a pattern), counts the item as not applied, and the
+  rest go on: **`{NAME.applied}`** and **`{NAME.failed}`** (with why) are lists, named by **`label`** (a template;
+  default the item's JSON). Not run with `--out`.
+- **`commit_changed`** (repository path globs: `**` any folders, `*` within one) makes the job an in-place one: before
+  anything runs, what git already sees as changed is recorded with a hash of each file; afterwards, **what changed in
+  those paths during the run is committed** (with `commit` and `commit_body`), and nothing else, even in a file that
+  had someone's uncommitted work in it before. Changes elsewhere are left alone and listed in
+  `{changed.outside}`. The record is kept under the queue's folder until the job finishes, so **a rerun after a usage
+  limit still counts the cut-off attempt's edits as the job's.** `{changed}` is what was committed, `{commit}` its
+  id, `{commit.error}` why it wasn't. The **output** is then a receipt, written after the commit and not committed
+  (put it outside the folder); with `--out`, Claude still edits but nothing is committed. A job that fails leaves its
+  edits uncommitted for a person to look at (`git diff`), or for a rerun to commit.
+- **`only_if`** in a `review`, `skipped` or `failed` table adds the item only when the template comes out non-empty:
+  `only_if = "{NOT APPLIED}{inbox.failed}"` raises it only when something wasn't applied.
+- **`{input.name}`** is the input file's name without `.json`: an output named after the request.
+- **`claude-headless --config FILE queue KIND --input FILE [--now]`** puts a job on the queue for the queue runner, as
+  the windowless exe, without waiting for it: for a program (a local web page, say) that hands work over. `--now`
+  starts the runner at once instead of at the queue task's next run (a runner already going takes the job next; at a
+  usage limit, it waits). The same job twice is queued once.
+
+```toml
+[[job]]
+name = "finalise-summary"
+work = ".."
+output = "%EA_LOCAL%/claude-headless/finalise-summary/{input.name}.md"     # the receipt
+claude = ["-p", "--output-format", "json", "--tools", "Read,Glob,Grep,Edit", "--restricted", "--strict-mcp-config",
+          "--permission-mode", "dontAsk", "--allowedTools", "Read,Glob,Grep,Edit(meetings/**/summaries/**)"]
+sections = ["CHANGED", "INBOX?", "NOT APPLIED?"]
+body = "CHANGED"
+commit_changed = ["meetings/**/summaries/*.md", "inbox/*.md"]
+commit = "Finalise {input.summary}"
+frontmatter = ["commit: {commit:json}", "changed: {changed:json}", "not-applied: {NOT APPLIED:json}"]
+review = { source = "summaries", type = "needs-you", title = "{input.summary}", not_applied = "{NOT APPLIED}?", only_if = "{NOT APPLIED}{inbox.failed}" }
+
+[[job.each]]
+name = "inbox"
+section = "INBOX"
+label = "{item.text}"
+run = ["%LOCALAPPDATA%/Programs/md-inbox/md-inbox.exe", "--config", "md-inbox.toml", "add", "{item.list}?", "{item.text}", "--no-commit"]
+
+[[job.turn]]
+text = '''Finalise {input.summary} with these answers: {input.answers} ...'''
 ```
 
 ## The Python package

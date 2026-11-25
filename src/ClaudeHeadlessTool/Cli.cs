@@ -45,6 +45,15 @@ public sealed class CliHost
 
     /// <summary>The windowless program the queue task runs.</summary>
     public Func<string> BackgroundExe { get; init; } = () => Path.Combine(AppContext.BaseDirectory, "claude-headless-background.exe");
+
+    /// <summary>queue --now (0.6.0): start the queue runner (the windowless exe's run-queue) without waiting for it. If
+    /// another runner holds the queue, the new one ends at once and the running one takes the job next.</summary>
+    public Action<string> StartQueue { get; init; } = exe =>
+    {
+        var info = new System.Diagnostics.ProcessStartInfo(exe) { UseShellExecute = false, CreateNoWindow = true };
+        info.ArgumentList.Add("run-queue");
+        System.Diagnostics.Process.Start(info)?.Dispose();
+    };
 }
 
 /// <summary>claude-headless: the seat's queue of Claude Code jobs (status, run-queue, autostart: background-tools-lib's
@@ -52,21 +61,25 @@ public sealed class CliHost
 public static class Cli
 {
     public const string Usage =
-        "usage: claude-headless [-h] [--version] [--config CONFIG] {status,run-queue,autostart,schedule,job} ...\n\n" +
+        "usage: claude-headless [-h] [--version] [--config CONFIG] {status,run-queue,autostart,schedule,job,queue} ...\n\n" +
         "claude-headless: the seat's queue of Claude Code jobs waiting out a usage limit, and jobs defined in settings.\n\n" +
         "    claude-headless status          the limit, if one is in force, and what's queued\n" +
         "    claude-headless run-queue       queue any scheduled jobs that are due, then run queued jobs one at a time,\n" +
         "                                    until done or the limit is back\n" +
         "    claude-headless --config FILE autostart on\n" +
         "                                    register the queue task from the settings' [schedule] (by default every 15\n" +
-        "                                    minutes, at logon and a minute after each unlock); off; status\n" +
+        "                                    minutes, at logon and a minute after each unlock); off; status;\n" +
+        "                                    restart: run the queue now with this version (after an upgrade)\n" +
         "    claude-headless --config FILE schedule on|off|status\n" +
         "                                    whether run-queue starts this settings file's scheduled jobs\n" +
         "    claude-headless --config FILE job KIND --input FILE\n" +
         "                                    a job from the settings: the input and the prompt to Claude, the reply\n" +
         "                                    checked and written where the settings say, committed, and a review item\n" +
         "        --out FILE                  write the output there instead: no commit, no review item, input kept\n" +
-        "        --force                     run it even if its output is there already\n";
+        "        --force                     run it even if its output is there already\n" +
+        "    claude-headless --config FILE queue KIND --input FILE\n" +
+        "                                    put a job from the settings on the queue, for the queue runner\n" +
+        "        --now                       and start the runner now, rather than at the queue task's next run\n";
 
     /// <summary>Kept beside the work folder (not in it: Claude reads there) between a usage limit and the rerun: the
     /// input, and each finished turn's session and reply, so the rerun carries on from the turn that was cut off.</summary>
@@ -99,6 +112,8 @@ public static class Cli
             return Schedule(args.Skip(1).ToList(), config, host);
         if (args.Count > 0 && args[0] == "autostart")
             return Autostart(args.Skip(1).ToList(), config, host);
+        if (args.Count > 0 && args[0] == "queue")
+            return QueueJob(args.Skip(1).ToList(), config, host);
         if (args.Count == 1 && args[0] == "run-queue")
         {
             // The scheduled jobs that are due go on the queue first, so this run starts them.
@@ -177,7 +192,7 @@ public static class Cli
                 afterUnlock = u;
                 i++;
             }
-            else if (action is null && args[i] is "on" or "off" or "status")
+            else if (action is null && args[i] is "on" or "off" or "restart" or "status")
                 action = args[i];
             else
                 return Bad(host, $"unrecognized arguments: {args[i]}");
@@ -230,6 +245,31 @@ public static class Cli
             case "off":
                 host.Out.WriteLine(task.Disable() ? "Autostart is off." : "Autostart was already off.");
                 return 0;
+            case "restart":
+                // After an upgrade (0.6.0). The queue task runs the queue and ends, so there's nothing long-running to
+                // replace: a run in progress is never stopped (that would kill the job it's running), and carries on
+                // with the version it started with; otherwise the task is started now, with this one.
+                var now = task.Status();
+                if (now is null)
+                {
+                    host.Out.WriteLine("Autostart is off, so there's nothing to restart.");
+                    return 0;
+                }
+                if (string.Equals(now.GetValueOrDefault("state"), "Running", StringComparison.OrdinalIgnoreCase))
+                {
+                    host.Out.WriteLine($"'{task.Name}' is running the queue now: it carries on as it is, and its next run uses {Version}.");
+                    return 0;
+                }
+                try
+                {
+                    host.Out.WriteLine(task.Start() ? $"Started '{task.Name}' now, with {Version}." : "Autostart is off, so there's nothing to restart.");
+                }
+                catch (InvalidOperationException error)
+                {
+                    host.Err.WriteLine(error.Message);
+                    return 1;
+                }
+                return 0;
             default:
                 var info = task.Status();
                 if (info is null)
@@ -275,9 +315,55 @@ public static class Cli
         };
     }
 
+    /// <summary>queue KIND --input FILE [--now] (0.6.0): put a job on the queue, as the windowless exe with this settings
+    /// file, for the queue runner (the queue task, or --now: a runner started at once). The same job twice is queued once.
+    /// For a program (a web page, say) that wants a job run without waiting for it or holding a window open.</summary>
+    private static int QueueJob(List<string> args, string? config, CliHost host)
+    {
+        string? kind = null, input = null;
+        var now = false;
+        for (var i = 0; i < args.Count; i++)
+        {
+            if (args[i] == "--input" && i + 1 < args.Count)
+                input = args[++i];
+            else if (args[i] == "--now")
+                now = true;
+            else if (kind is null && !args[i].StartsWith('-'))
+                kind = args[i];
+            else
+                return Bad(host, $"unrecognized arguments: {args[i]}");
+        }
+        if (config is null || kind is null || input is null)
+            return Bad(host, "queue needs --config FILE, the kind, and --input FILE");
+        try
+        {
+            var settings = JobsConfig.Load(config, host.Env);
+            if (!settings.Kinds.ContainsKey(kind))
+                throw new UsageException($"No job called '{kind}' in {settings.Path} (there are: {string.Join(", ", settings.Kinds.Keys)}).");
+            var full = Path.GetFullPath(input);
+            if (!File.Exists(full))
+                throw new UsageException($"No input at {full}.");
+            var added = host.Queue.Add([host.ScheduledExe(), "--config", settings.Path, "job", kind, "--input", full], settings.Dir);
+            host.Out.WriteLine(added ? $"Queued {kind} for {full}." : $"{kind} for {full} is queued already.");
+            if (now)
+            {
+                host.StartQueue(host.BackgroundExe());
+                host.Out.WriteLine(host.Queue.LimitUntil() is { } until
+                    ? $"The usage limit is in force until {until.ToLocalTime():HH:mm}: it runs after that."
+                    : "Started the queue runner.");
+            }
+            return 0;
+        }
+        catch (UsageException error)
+        {
+            host.Err.WriteLine(error.Message);
+            return 2;
+        }
+    }
+
     private static int Bad(CliHost host, string message)
     {
-        host.Err.WriteLine("usage: claude-headless [-h] [--version] [--config CONFIG] {status,run-queue,autostart,schedule,job} ...");
+        host.Err.WriteLine("usage: claude-headless [-h] [--version] [--config CONFIG] {status,run-queue,autostart,schedule,job,queue} ...");
         host.Err.WriteLine($"claude-headless: error: {message}");
         return 2;
     }
@@ -363,6 +449,7 @@ public static class Cli
         var values = new Dictionary<string, object?>(StringComparer.Ordinal)
         {
             ["date"] = date, ["today"] = host.Today(), ["input.path"] = inputPath,
+            ["input.name"] = Path.GetFileNameWithoutExtension(inputPath),
         };
         object? Value(string name)
         {
@@ -392,8 +479,19 @@ public static class Cli
         values["work"] = work;
         string reply;
         List<string>? body = null;
+        Dictionary<string, List<string>>? replySections = null;
+
+        // A job that edits in place (commit_changed): what git already sees as changed, before the job touches anything,
+        // so only what the job changed is committed. Kept until the job finishes, so a rerun after a usage limit (which
+        // may have cut Claude off half way through its edits) still counts the earlier attempt's edits as the job's.
+        Committer? inPlace = settings.Git is { Commit: true } inPlaceGit && job.CommitChanged.Count > 0 && outFile is null
+            ? host.Committer(inPlaceGit.Repo) : null;
+        var snapshot = inPlace is null ? null : Changes.SnapshotFile(host.Queue.Home, job.Name, inputPath);
+        IReadOnlyDictionary<string, string>? before = null;
         try
         {
+            if (inPlace is not null)
+                before = Changes.Before(inPlace, snapshot!);
             foreach (var extract in job.Extracts)
                 values[$"extract.{extract.Name}"] = Jobs.Extract(extract, input);
 
@@ -404,7 +502,11 @@ public static class Cli
             if (done.Count == 0)
             {
                 if (job.FreshWork && Directory.Exists(work))
-                    Directory.Delete(work, true);   // nothing left from another run: the method may depend on what's here
+                {
+                    if (Directory.Exists(Path.Combine(work, ".git")) || File.Exists(Path.Combine(work, ".git")))
+                        throw new InvalidDataException($"fresh_work would empty {work}, a git repository: not done");
+                    Directory.Delete(work, true);
+                }   // nothing left from another run: the method may depend on what's here
                 Directory.CreateDirectory(work);
                 foreach (var step in job.Prepare)
                     Prepare(step, Value, settings, host, log, job.Name);
@@ -451,15 +553,14 @@ public static class Cli
                 log($"job {job.Name}: skipped: {string.Join("; ", (List<string>)values[skipName]!)}");
                 if (outFile is not null)
                     return 0;
-                if (job.Skipped is { } skipped && settings.ReviewFile is { } skippedFile)
-                    new QueueFile(skippedFile, settings.ReviewLock).Add(skipped.Source, skipped.Type, Fields(skipped, Value));
-                Finish(job, inputPath, work);
+                AddItem(settings, job.Skipped, Value);
+                Finish(job, inputPath, work, snapshot);
                 return 0;
             }
 
             if (job.Sections.Count > 0)
             {
-                var sections = Jobs.Sections(reply, job.Sections);
+                var sections = replySections = Jobs.Sections(reply, job.Sections);
                 foreach (var (name, _) in job.Sections.Where(s => s.Name != job.Body))
                     values[name] = Jobs.Items(sections.GetValueOrDefault(name), job.EmptyItems);
                 if (job.Body is not null)
@@ -477,7 +578,7 @@ public static class Cli
         {
             log($"job {job.Name}: nothing to do{(nothing.Message.Length > 0 ? $": {nothing.Message}" : "")}");
             if (outFile is null)
-                Finish(job, inputPath, work);
+                Finish(job, inputPath, work, snapshot);
             return 0;
         }
         catch (Exception error) when (error is InvalidDataException or ClaudeRunException or TimeoutException or IOException)
@@ -505,6 +606,49 @@ public static class Cli
                 log($"job {job.Name}: WARNING no table block in turn {table.Turn}'s reply; {Shown(tablePath)} left as it is");
         }
 
+        // The reply's items applied through their commands (not with --out: that's a try, which changes nothing).
+        foreach (var each in job.Each)
+        {
+            if (outFile is null)
+                RunEach(each, replySections?.GetValueOrDefault(each.Section), job, settings, Value, values, host, log);
+            else
+                log($"job {job.Name}: {each.Name}: not run (--out)");
+        }
+
+        // Edited in place: commit what changed in the paths the job may change, and only that, before the receipt.
+        if (inPlace is not null && before is not null && settings.Git is { } placeGit)
+        {
+            var globs = job.CommitChanged.Select(Jobs.Glob).ToList();
+            List<string> inside, outside;
+            try
+            {
+                (inside, outside) = Changes.Since(inPlace, before, globs);
+            }
+            catch (IOException error)
+            {
+                (inside, outside) = ([], []);
+                values["commit.error"] = error.Message;
+                log($"job {job.Name}: couldn't see what changed: {error.Message}");
+            }
+            values["changed"] = inside;
+            values["changed.outside"] = outside;
+            if (outside.Count > 0)
+                log($"job {job.Name}: changed outside commit_changed, not committed: {string.Join(", ", outside)}");
+            if (inside.Count > 0)
+            {
+                var subject = Jobs.Fill(job.Commit!, Value, single: true)!;
+                var committed = inPlace.Commit(Committer.Message(subject, job.CommitBody is null ? null : Jobs.Fill(job.CommitBody, Value)),
+                    inside, trailers: placeGit.Trailers, push: placeGit.Push);
+                values["commit"] = committed.Commit ?? "";
+                values["commit.error"] = committed.Error ?? "";   // git not set up here (Skipped) is no error
+                log(committed.Error is { } e ? $"  commit failed: {e}" : committed.Committed
+                    ? $"  committed {committed.Commit} ({inside.Count} file(s)){(placeGit.Push ? committed.Pushed ? ", pushed" : $", push failed: {committed.PushError}" : "")}"
+                    : $"  nothing committed{(committed.Skipped is { } s ? $": {s}" : "")}");
+            }
+            else
+                log($"job {job.Name}: nothing changed to commit");
+        }
+
         var lines = new List<string>();
         if (job.Frontmatter.Count > 0)
         {
@@ -519,14 +663,14 @@ public static class Cli
         lines.AddRange(body);
         Directory.CreateDirectory(Path.GetDirectoryName(target)!);
         File.WriteAllText(target, string.Join("\n", lines) + "\n", new UTF8Encoding(false));
-        log($"job {job.Name}: drafted {Shown(target)}");
+        log($"job {job.Name}: {(job.CommitChanged.Count > 0 ? "wrote the receipt" : "drafted")} {Shown(target)}");
         if (outFile is not null)
             return 0;
         if (tablePath is not null && tableText is not null)
             File.WriteAllText(tablePath, tableText, new UTF8Encoding(false));
 
-        var keptByGit = false;
-        if (settings.Git is { Commit: true } git && job.Commit is not null)
+        var keptByGit = job.CommitChanged.Count > 0;   // in place: committed above; the receipt is no draft to keep
+        if (settings.Git is { Commit: true } git && job.Commit is not null && job.CommitChanged.Count == 0)
         {
             var paths = new List<string> { target };
             if (tablePath is not null && tableText is not null)
@@ -558,18 +702,91 @@ public static class Cli
                 log($"  couldn't keep the as-written copy: {error.Message}");
             }
         }
-        if (job.Review is { } review && settings.ReviewFile is { } file)
-            new QueueFile(file, settings.ReviewLock).Add(review.Source, review.Type, Fields(review, Value));
+        AddItem(settings, job.Review, Value);
         if (job.Notify is { } notify)
             host.Notify(Jobs.Fill(notify.Title, Value, single: true)!, [Jobs.Fill(notify.Text, Value)!]);
-        Finish(job, inputPath, work);
+        Finish(job, inputPath, work, snapshot);
         return 0;
     }
 
-    /// <summary>A job done (or skipped, or with nothing to do): the input and its attachments deleted (unless the
-    /// settings keep it), and the progress file.</summary>
-    private static void Finish(JobKind job, string inputPath, string work)
+    /// <summary>A review item from its template, unless its only_if comes out empty (0.6.0).</summary>
+    private static void AddItem(JobsConfig settings, ReviewTemplate? review, Func<string, object?> value)
     {
+        if (review is null || settings.ReviewFile is not { } file)
+            return;
+        if (review.OnlyIf is { } onlyIf && (Jobs.Fill(onlyIf, value, single: true) ?? "").Trim().Length == 0)
+            return;
+        new QueueFile(file, settings.ReviewLock).Add(review.Source, review.Type, Fields(review, value));
+    }
+
+    /// <summary>One [[job.each]] (0.6.0): each line of its reply section a JSON object (a line of a JSON list, or a list
+    /// on one line, will do; code fences are ignored), and its command run for each, in the settings' folder. What it
+    /// did is {NAME.applied}, and what it couldn't, with why, {NAME.failed}: one failing doesn't stop the rest.</summary>
+    private static void RunEach(EachSpec each, List<string>? lines, JobKind job, JobsConfig settings, Func<string, object?> value,
+        Dictionary<string, object?> values, CliHost host, Action<string> log)
+    {
+        var applied = new List<string>();
+        var failed = new List<string>();
+        foreach (var line in Jobs.Items(lines, job.EmptyItems).Where(l => !l.StartsWith("```", StringComparison.Ordinal)))
+        {
+            JsonNode? parsed = null;
+            try
+            {
+                parsed = JsonNode.Parse(line.TrimEnd(','));
+            }
+            catch (JsonException)
+            {
+            }
+            var items = parsed switch
+            {
+                JsonObject o => [o],
+                JsonArray a when a.All(x => x is JsonObject) => a.Select(x => x!.AsObject()).ToList(),
+                _ => new List<JsonObject>(),
+            };
+            if (items.Count == 0)
+                failed.Add($"{PyStr.Head(line, 120)} (not a JSON object)");
+            foreach (var item in items)
+            {
+                object? ItemValue(string name) => name.StartsWith("item.", StringComparison.Ordinal) ? Jobs.ItemField(item, name[5..]) : value(name);
+                var label = each.Label is not null && Jobs.Fill(each.Label, ItemValue, single: true) is { Length: > 0 } l ? l : item.ToJsonString();
+                var argv = each.Run.Select(a => Jobs.Fill(a, ItemValue, single: true)).OfType<string>().ToList();
+                if (argv.Count == 0)
+                {
+                    failed.Add($"{label} (no command)");
+                    continue;
+                }
+                if (argv[0].Contains('/') || argv[0].Contains('\\'))
+                    argv[0] = settings.Resolve(argv[0]);
+                int exit;
+                string output;
+                try
+                {
+                    (exit, output) = host.RunStep(argv, settings.Dir);
+                }
+                catch (Exception error) when (error is System.ComponentModel.Win32Exception or IOException or InvalidOperationException or TimeoutException)
+                {
+                    (exit, output) = (-1, error.Message);
+                }
+                var said = PyStr.Head(output.Trim().Replace("\r\n", " ").Replace('\n', ' '), 200);
+                if (exit != 0)
+                    failed.Add($"{label} ({Path.GetFileNameWithoutExtension(argv[0])} exited {exit}: {said})");
+                else if (each.AppliedIf is { } ok && !ok.IsMatch(output.Trim()))
+                    failed.Add($"{label} ({Path.GetFileNameWithoutExtension(argv[0])} said: {said})");
+                else
+                    applied.Add(label);
+            }
+        }
+        values[$"{each.Name}.applied"] = applied;
+        values[$"{each.Name}.failed"] = failed;
+        log($"job {job.Name}: {each.Name}: {applied.Count} applied" + (failed.Count > 0 ? $", {failed.Count} not: {string.Join("; ", failed)}" : ""));
+    }
+
+    /// <summary>A job done (or skipped, or with nothing to do): the input and its attachments deleted (unless the
+    /// settings keep it), the progress file, and an in-place job's snapshot.</summary>
+    private static void Finish(JobKind job, string inputPath, string work, string? snapshot = null)
+    {
+        if (snapshot is not null && File.Exists(snapshot))
+            File.Delete(snapshot);
         if (job.DeleteInput)
         {
             File.Delete(inputPath);
@@ -628,8 +845,7 @@ public static class Cli
         values["error"] = why;
         log($"job {job.Name}: failed: {why}");
         host.Err.WriteLine($"couldn't run the job: {why}");
-        if (job.Failed is { } failed && settings.ReviewFile is { } file)
-            new QueueFile(file, settings.ReviewLock).Add(failed.Source, failed.Type, Fields(failed, value));
+        AddItem(settings, job.Failed, value);
         return 1;
     }
 

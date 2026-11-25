@@ -1,0 +1,124 @@
+# finalise-summary: a draft meeting summary finalised with the owner's answers to its questions, unattended (0.6.0).
+#
+# For a page or tool that collects the answers straight after a meeting and hands them over: it writes the input (below)
+# and runs `claude-headless --config config/claude-headless.toml queue finalise-summary --input <file> --now`. Claude
+# works in the folder itself, finalising the draft as the transcripts skill and the meetings rule say (answers applied,
+# [Check] quotes fixed, [Noted] moved to Transcript notes, For review / [DRAFT] / status: draft removed, the review
+# ledger and the project page updated). It can only read, and edit the summaries, the ledger and project pages; it adds
+# nothing to the inbox lists itself: it lists the items, and md-inbox adds them. What changed in those paths during the
+# run is committed in one commit, and nothing else; a receipt is written outside the folder; a review item is added only
+# if something couldn't be applied.
+#
+# The input (JSON):
+#   {
+#     "summary": "meetings/catch-ups/ann-lee/summaries/2026-11-24.md",           # the draft, from the folder's top
+#     "answers": [{"question": "Is 'the portal' the partner portal?", "answer": "Yes, the partner portal."}],
+#     "waiting_fors": ["Ann Lee to send the tag list"],                          # the suggestions ticked (text, or
+#                                                                                 #  {"text": ..., "chase": "2026-12-02"})
+#     "dictation": ["Claude, please add an action for me to book the budget review"]   # candidates confirmed (text, or
+#   }                                                                             #  {"text": ..., "where": "mine"})
+# A question left out wasn't answered (it goes to Transcript notes). waiting_fors and dictation may be [] or left out.
+#
+# Paste the [[job]] below into the settings file (config/claude-headless.toml), after [git] and [review], and set
+# values: owner (a first name) and initials (the label on the draft's questions, as in [AB]).
+
+[[job]]
+name = "finalise-summary"
+values = { owner = "Alex", initials = "AB" }
+output = "%EA_LOCAL%/claude-headless/finalise-summary/{input.name}.md"   # the receipt, outside the folder
+work = ".."                               # the folder itself (this file is in config/): Claude edits in place
+claude = ["-p", "--output-format", "json", "--model", "opus", "--tools", "Read,Glob,Grep,Edit", "--restricted",
+          "--strict-mcp-config", "--permission-mode", "dontAsk",
+          "--allowedTools", "Read,Glob,Grep,Edit(meetings/**/summaries/**),Edit(meetings/review-ledger.md),Edit(projects/**)"]
+timeout_minutes = 30
+sections = ["CHANGED", "INBOX?", "NOT APPLIED?"]
+body = "CHANGED"
+skip = "SKIP"                             # not a draft (or not there): nothing changed, a skipped item
+# What the run may change, and so what's committed (repository paths): the Edit rules above, and the lists md-inbox adds to.
+commit_changed = ["meetings/**/summaries/*.md", "meetings/review-ledger.md", "projects/*.md", "inbox/*.md"]
+commit = "Finalise the summary {input.summary} with {value.owner}'s answers"
+commit_body = "Written automatically by claude-headless job finalise-summary. Inbox items added: {inbox.applied|none}"
+frontmatter = [
+  "summary: {input.summary:json}",
+  "finalised: {today:json}",
+  "commit: {commit:json}",
+  "changed: {changed:json}",
+  "inbox-added: {inbox.applied:json}",
+  "inbox-not-added: {inbox.failed:json}",
+  "not-applied: {NOT APPLIED:json}",
+  "not-committed: {changed.outside:json}",
+  "commit-error: {commit.error:json}",
+]
+review = { source = "finalise-summary", type = "needs-you", title = "Finalised, with something left for you: {input.summary}", summary = "{input.summary}", commit = "{commit}?", not_applied = "{NOT APPLIED}?", inbox_not_added = "{inbox.failed}?", commit_error = "{commit.error}?", receipt = "{output}", only_if = "{NOT APPLIED}{inbox.failed}{commit.error}" }
+skipped = { source = "finalise-summary", type = "skipped", title = "Not finalised: {input.summary}", reason = "{SKIP}" }
+failed = { source = "finalise-summary", type = "failed", title = "Couldn't finalise {input.summary}", error = "{error}", saved = "{input.path}", rerun = "claude-headless --config config/claude-headless.toml job finalise-summary --input {input.path}" }
+
+# Each INBOX line is added with md-inbox, uncommitted, so it goes in the job's one commit.
+[[job.each]]
+name = "inbox"
+section = "INBOX"
+label = "{item.text}"
+run = ["%LOCALAPPDATA%/Programs/md-inbox/md-inbox.exe", "--config", "md-inbox.toml", "add", "{item.list}?",
+       "--section={item.section}?", "{item.text}", "--no-commit"]
+
+[[job.turn]]
+text = '''This is an unattended background job, not a session with {value.owner}: skip any session-start routine (no
+briefing), ask no questions (nobody will answer), run nothing, and change only what's described here.
+
+{value.owner} ({value.initials}) has answered the questions in a draft meeting summary. Finalise it.
+
+- The draft: {input.summary}
+- Their answers to its [{value.initials}] questions (JSON: each question as the draft asks it, and the answer; a
+  question that isn't here wasn't answered): {input.answers}
+- The suggested waiting-fors they ticked (JSON): {input.waiting_fors|[]}
+- The dictated instructions they confirmed (JSON): {input.dictation|[]}
+- Today: {today:dddd d MMMM yyyy}
+
+How a summary is finalised is in .claude/skills/transcripts/SKILL.md ("Finalising draft summaries") and
+.claude/rules/kit/meetings.md ("Summaries", and "File the item where they said"); project pages are
+.claude/rules/kit/projects.md. Read them first. Where they and this differ, this wins. The job commits what you
+change, and sharing the summary is offered to {value.owner} separately: don't save, commit or share, or mention either.
+
+1. Read the draft in full, and its transcript (`transcript:` in its frontmatter) wherever an answer or a quote needs it.
+2. Apply each answer where its question was asked, and wherever else in the summary the point appears: correct the
+   name, term, decision, owner or date it's about. "Leave it out" (or the like) removes the point; "not sure", or no
+   answer, leaves it unresolved.
+3. Fix each [Check] item: correct the quotation from the transcript, or take the quotation marks off a paraphrase.
+4. Move the [Noted] items, and anything still unresolved, into a `## Transcript notes` section at the end (add it if
+   there isn't one), each a plain bullet.
+5. Remove the `## For review` section and everything in it, the `[DRAFT]` marker and `status: draft` (leave the rest
+   of the frontmatter as it is).
+6. The review ledger (meetings/review-ledger.md, if there is one): for each answered question it has open, apply the
+   answer to every other draft summary that asked it, then move it to Settled if it will recur (a name, a term, a
+   standing fact) or delete it. Remove this draft's remaining Open lines.
+7. Check the `project:` tag fits the meeting. For each project it names that has a page in projects/, add a Timeline
+   row for this meeting and any change to Status, Decisions to date, Open actions or Open questions, and bump
+   `updated:`. Don't create a page: say so under NOT APPLIED.
+8. Don't edit the inbox lists: put each item to add under INBOX, and the job adds it with md-inbox.
+   - A ticked waiting-for: list "waiting", text `[Waiting: <Full Name>, <chase date as 2 Dec 2026>] <what>. <The
+     meeting and its date, and any context>`. The chase date is the one the item gives, else a week after today.
+     Full names are in stakeholders/.
+   - A confirmed dictated instruction, filed where it was addressed: list is an inbox/ file's name without .md, and
+     section (where that list has more than one) a few letters of its `## ` heading; read the list to choose. Text
+     `[<Tag>] <Headline>. <Detail>`, quoting the instruction verbatim, with the meeting, its date and the context
+     around it. A tag that config/md-inbox.toml's [tags] routes can stand in for the list and section.
+
+Never add a need-to-know code name, or personnel detail, that the draft's own text doesn't already carry.
+
+If {input.summary} isn't there, or isn't a draft (no `status: draft` and no `[DRAFT]`), change nothing and reply only:
+SKIP: <why>
+
+Otherwise reply in exactly this shape, with nothing before it:
+
+CHANGED:
+- <a file you changed>: <what changed, in a line>
+INBOX:
+{{"list": "waiting", "text": "[Waiting: Ann Lee, 2 Dec 2026] The tag list. From the 24 Nov 2026 catch-up: Ann will send it after the release."}}
+{{"list": "mine", "section": "Act", "text": "[Action] Book the budget review. Dictated in the 24 Nov 2026 catch-up: \"Claude, please add an action for me to book the budget review\"."}}
+NOT APPLIED:
+- <an answer or ticked item you couldn't apply, and why; or something you found that needs {value.owner}'s decision,
+  such as an open inbox item the meeting seems to have answered (say which list and item)>
+
+INBOX has one JSON object a line, or "none". An answer applied as unresolved (moved to Transcript notes) counts as
+applied. NOT APPLIED is "none" when everything was applied and nothing needs a decision.
+'''
